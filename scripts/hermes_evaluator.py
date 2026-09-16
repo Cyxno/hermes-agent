@@ -95,6 +95,11 @@ def state_db():
       delta real, last_checked text);
     create table if not exists cursors(
       name text primary key, value text, last_checked text);
+    create table if not exists dumbscope_incidents(
+      fingerprint text primary key, source_fingerprint text, incident_id text,
+      status text, severity text, title text, last_seen_ms integer,
+      resolved_at_ms integer, occurrences integer, last_processed_at text,
+      host_correlations text);
     """)
     return c
 
@@ -103,7 +108,7 @@ def now_iso():
 
 def emit(mode, check, fp, *, current=None, previous=None, trend=None, mn=None, mx=None,
          severity="normal", provisional=True, state="observed", baseline_pending=True,
-         reason="", recommended_diagnostic=None, source="fast", sample_ts=None):
+         reason="", recommended_diagnostic=None, source="fast", sample_ts=None, extra=None):
     row = {"ts": now_iso(), "run_id": RUN_ID, "mode": mode, "check": check,
            "fingerprint": fp, "current": current, "previous": previous,
            "trend": trend or {}, "min24": mn, "max24": mx, "severity": severity,
@@ -111,6 +116,8 @@ def emit(mode, check, fp, *, current=None, previous=None, trend=None, mn=None, m
            "provisional": provisional, "reason": reason,
            "recommended_diagnostic": recommended_diagnostic, "source": source,
            "sample_ts": sample_ts, "dry_run": DRY_RUN}
+    if extra:
+        row.update(extra)
     with EVENTS.open("a") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
     return row
@@ -334,6 +341,166 @@ def pct_metric(c, cfg, events, *, fp, metric, label, th, sustain_need, value, po
                            source=source, sample_ts=sample_ts))
     return NAME[lvl], prov
 
+# ---------------------------------------------------------------- dumbscope --
+def make_client(cfg):
+    """Factory (testbaar: tests monkeypatchen deze)."""
+    import hermes_dumbscope as hd
+    d = cfg.get("dumbscope", {})
+    return hd.DumbScopeClient(base_url=d.get("base_url", "http://192.168.1.2:8091"),
+                              username=d.get("username", "remco"),
+                              secrets_dir=str(HOME / "secrets"),
+                              timeout=int(d.get("timeout_s", 15)))
+
+def run_dumbscope(cfg, c, events, mode="fast"):
+    """DUMBscope-poll in de fast evaluator. Failure-isolation (§21): een fout
+    hier crasht de host-evaluatie nooit; beschikbaarheid krijgt eigen
+    incident-state met anti-flapping (pas na N opeenvolgende mislukkingen)."""
+    dcfg = dict(cfg.get("dumbscope") or {})
+    bp = bool(dcfg.get("baseline_pending", True))
+    fail_warn = int(dcfg.get("failure_warning_polls", 3))
+    fail_urgent = int(dcfg.get("failure_urgent_polls", 12))
+    resolved_limit = int(dcfg.get("resolved_poll_limit", 20))
+    st = {}
+
+    def failures():
+        row = c.execute("select value from cursors where name='dumbscope:failures'").fetchone()
+        return int(float(row[0])) if row else 0
+
+    def set_failures(n):
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('dumbscope:failures', ?, ?) on conflict(name) do update"
+                  " set value=excluded.value, last_checked=excluded.last_checked",
+                  (str(n), now_iso()))
+
+    try:
+        client = make_client(cfg)
+        result = client.poll(resolved_limit=resolved_limit)
+    except Exception as e:  # noqa: BLE001 — bewust breed: isolatie is het doel
+        reason = getattr(e, "reason", type(e).__name__)
+        n = failures() + 1
+        set_failures(n)
+        lvl = 3 if n >= fail_urgent else (2 if n >= fail_warn else 0)
+        if lvl:
+            _, etype = incident_upsert(c, "dumbscope:availability", source="dumbscope",
+                                       itype="availability", sev_level=lvl, value=n,
+                                       reason=f"{n} opeenvolgende mislukte polls ({reason})")
+            if etype in ("new", "escalated"):
+                events.append(emit(mode, "dumbscope_availability", "dumbscope:availability",
+                                   current=n, severity=NAME[lvl], provisional=bp, state="active",
+                                   baseline_pending=bp,
+                                   reason=f"DUMBscope onbereikbaar/auth: {reason} ({n} polls)",
+                                   source="dumbscope"))
+        c.commit()
+        st["dumbscope"] = f"unavailable ({reason}, poll {n})"
+        return st
+
+    # succes: herstel availability-incident indien aanwezig
+    n = failures()
+    if n:
+        set_failures(0)
+        _, etype = incident_upsert(c, "dumbscope:availability", source="dumbscope",
+                                   itype="availability", sev_level=0, value=0,
+                                   reason="DUMBscope weer bereikbaar")
+        if etype == "resolved":
+            events.append(emit(mode, "dumbscope_availability", "dumbscope:availability",
+                               severity="normal", provisional=bp, state="resolved",
+                               baseline_pending=True, reason=f"hersteld na {n} mislukte polls",
+                               source="dumbscope"))
+    c.execute("insert into cursors(name, value, last_checked) values('dumbscope:last_poll', ?, ?)"
+              " on conflict(name) do update set value=excluded.value, last_checked=excluded.last_checked",
+              (now_iso(), now_iso()))
+    st["dumbscope"] = result["health"].get("dumb")
+    st["dumbscope_active"] = result["metrics"].get("active_count")
+    st["dumbscope_payload"] = result["metrics"].get("payload_bytes")
+
+    # host-correlaties: gelijktijdige actieve hostproblemen (geen oorzaak-claim, §13)
+    hostcor = [r[0] for r in c.execute(
+        "select fingerprint from incidents where (source is null or source != 'dumbscope')"
+        " and state in ('active','recovering')"
+        " and current_severity in ('warning','urgent','critical')")]
+
+    seeded_row = c.execute("select value from cursors where name='dumbscope:seeded'").fetchone()
+    seeded = seeded_row is not None
+    changed = 0
+
+    def emit_ds(inc, ev_state, sev, changed_fields, reason):
+        events.append(emit(mode, "dumbscope_incident", inc["fingerprint"],
+                           current={"status": inc["source_status"], "occurrences": inc["occurrences"],
+                                    "last_seen": inc["last_seen"]},
+                           severity=sev, provisional=bp and not inc["severity_unmapped"],
+                           state=ev_state, baseline_pending=bp, reason=reason,
+                           source="dumbscope",
+                           extra={"source_status": inc["source_status"],
+                                  "source_incident_id": inc["source_incident_id"],
+                                  "title": inc["title"],
+                                  "root_cause_service": inc["root_cause_service"],
+                                  "affected_services": inc["affected_services"],
+                                  "occurrences": inc["occurrences"],
+                                  "changed_fields": changed_fields,
+                                  "host_correlations": hostcor,
+                                  "evidence": inc["evidence"][:3],
+                                  "severity_source": inc["severity_source"],
+                                  "severity_unmapped": inc["severity_unmapped"]}))
+
+    for inc in result["incidents"]:
+        fp = inc["fingerprint"]
+        row = c.execute("select incident_id, status, severity, occurrences, last_seen_ms"
+                        " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
+        if row is None:
+            c.execute("insert into dumbscope_incidents values(?,?,?,?,?,?,?,?,?,?,?)",
+                      (fp, inc["source_fingerprint"], inc["source_incident_id"], inc["source_status"],
+                       inc["severity"], inc["title"], inc["last_seen_ms"], inc["resolved_at_ms"],
+                       inc["occurrences"], now_iso(), json.dumps(hostcor)))
+            if seeded:
+                emit_ds(inc, "resolved" if inc["state"] == "resolved" else "active",
+                        inc["severity"], ["new"], "nieuw DUMBscope-incident")
+                changed += 1
+            continue
+        inc_id, s_status, s_sev, s_occ, s_last = row
+        changed_fields = []
+        if s_status != inc["source_status"]:
+            changed_fields.append(f"status:{s_status}->{inc['source_status']}")
+        if (inc["occurrences"] or 0) > (s_occ or 0):
+            changed_fields.append(f"occurrences:{s_occ}->{inc['occurrences']}")
+        if s_sev != inc["severity"]:
+            changed_fields.append(f"severity:{s_sev}->{inc['severity']}")
+        if not changed_fields:
+            continue  # identieke poll: geen event (§18)
+        c.execute("update dumbscope_incidents set incident_id=?, status=?, severity=?,"
+                  " occurrences=?, last_seen_ms=?, resolved_at_ms=?, last_processed_at=?,"
+                  " host_correlations=? where fingerprint=?",
+                  (inc["source_incident_id"], inc["source_status"], inc["severity"],
+                   inc["occurrences"], inc["last_seen_ms"], inc["resolved_at_ms"], now_iso(),
+                   json.dumps(hostcor), fp))
+        # lifecycle: DUMBscope kent active/resolved — Hermes volgt 1-op-1 (§9)
+        if inc["source_status"] == "resolved":
+            ev_state, sev = "resolved", "normal"
+        elif s_status == "resolved":
+            ev_state, sev = "reopened", inc["severity"]
+        elif "severity:" in " ".join(changed_fields):
+            ev_state, sev = "active", inc["severity"]  # escalatie/de-escalatie
+        else:
+            ev_state, sev = "active", inc["severity"]
+        reason = "wijziging: " + ", ".join(changed_fields)
+        if inc["severity_unmapped"]:
+            reason += f" [onbekende severity '{inc['severity_source']}' -> notice]"
+        emit_ds(inc, ev_state, sev, changed_fields, reason)
+        changed += 1
+
+    if not seeded:
+        n_all = c.execute("select count(*) from dumbscope_incidents").fetchone()[0]
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('dumbscope:seeded', '1', ?) on conflict(name) do update"
+                  " set value=excluded.value, last_checked=excluded.last_checked", (now_iso(),))
+        events.append(emit(mode, "dumbscope_baseline", "dumbscope:baseline",
+                           current={"seeded": n_all, "active": result["metrics"].get("active_count")},
+                           severity="normal", provisional=bp, state="seeded", baseline_pending=bp,
+                           reason=f"eerste poll: {n_all} bekende incidenten geseed (geen per-incident events)",
+                           source="dumbscope"))
+    c.commit()
+    st["dumbscope_changed"] = changed
+    return st
+
 # -------------------------------------------------------------------- fast --
 PCT_RULES_FAST = [
     ("mem_used_pct", "host:memory:high", "memory", "memory", 0.5),
@@ -484,6 +651,18 @@ def run_fast(cfg, events):
         c.execute("insert into cursors(name, value, last_checked) values('fast:last_ts', ?, ?)"
                   " on conflict(name) do update set value=excluded.value, last_checked=excluded.last_checked",
                   (str(int(new_ts[-1])), now_iso()))
+    # DUMBscope-poll (fase 4): failure-isolated — een fout hier raakt de
+    # host-evaluatie niet (§21); nog vóór de slot-commit van run_fast.
+    try:
+        ds = run_dumbscope(cfg, c, events, mode="fast")
+        st.update({k: v for k, v in ds.items()})
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+        events.append(emit("fast", "dumbscope_integration", "dumbscope:integration_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"integratiefout (host-monitoring onaangetast): {type(e).__name__}: {e}"[:240],
+                           source="dumbscope"))
+        st["dumbscope"] = "integration_error"
     active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
     c.commit(); c.close()
     return {"mode": "fast", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
@@ -941,6 +1120,131 @@ def run_test(cfg):
     inc, _ = eval_in(fresh({"mem_used_pct": [91, 91, 80, 80, 80]}))
     st, sev = inc.get("host:memory:high", ("missing", "?"))
     check("recovery WARNING -> RECOVERING/RESOLVED", st in ("recovering", "resolved"), f"{st}/{sev}")
+
+    # ── DUMBscope-integratie (§18) ──
+    def raw_inc(fp, sev="warning", status="active", occ=1, rid=None):
+        return {"id": rid or f"inc-{fp}", "fingerprint": fp, "severity": sev, "status": status,
+                "title": f"title {fp}", "summary": "s", "rootCauseService": "plex",
+                "affectedServices": ["plex"], "firstSeen": 1000, "lastSeen": 2000,
+                "resolvedAt": 3000 if status == "resolved" else None,
+                "occurrences": occ, "evidence": [{"at": 1, "message": "ev1"}, {"at": 2, "message": "ev2"}]}
+
+    def dsresult(incidents):
+        import hermes_dumbscope as _hd
+        _n = _hd.normalize_incident
+        n_active = len([i for i in incidents if i["status"] == "active"])
+        return {"ok": True, "health": {"status": "ok", "dumb": "connected"}, "incidents": [_n(i) for i in incidents],
+                "metrics": {"active_count": n_active, "resolved_fetched":
+                            len([i for i in incidents if i["status"] == "resolved"]),
+                            "payload_bytes": 1234, "runtime_s": 0.05}}
+
+    class FakeDS:
+        def __init__(self, steps): self.steps, self.i = steps, 0
+        def poll(self, resolved_limit=20):
+            s = self.steps[min(self.i, len(self.steps) - 1)]
+            self.i += 1
+            if isinstance(s, Exception):
+                raise s
+            return s
+
+    def ds_scenario(steps, seed_host_warning=False, polls=1):
+        tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "events.jsonl")
+        real_mc = globals().get("make_client")
+        fake_ds = FakeDS(steps)
+        globals()["make_client"] = lambda cfg: fake_ds
+        all_evs = []
+        rows, avail = {}, None
+        try:
+            con = sqlite3.connect(SAMPLES_DB); con.close()
+            for _ in range(polls):
+                con = state_db()
+                if seed_host_warning:
+                    con.execute("insert or ignore into incidents(fingerprint, source, type, state,"
+                                " current_severity, previous_severity, first_seen, last_seen,"
+                                " last_changed, occurrences, last_value, peak_value, last_alert_at,"
+                                " last_reason) values('host:memory:high','fast','mem','active',"
+                                "'warning','normal','t','t','t',1,90,90,'t','synthetic')")
+                con.commit()
+                evs = []
+                run_dumbscope(cfg, con, evs, mode="fast")
+                con.close()
+                all_evs.extend(evs)
+            c2 = sqlite3.connect(STATE_DB)
+            for fp, status, sev, occ in c2.execute(
+                    "select fingerprint, status, severity, occurrences from dumbscope_incidents"):
+                rows[fp] = (status, sev, occ)
+            avail = c2.execute("select state, current_severity from incidents"
+                               " where fingerprint='dumbscope:availability'").fetchone()
+            c2.close()
+            return all_evs, rows, avail
+        finally:
+            globals()["make_client"] = real_mc
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def ds_events(evs):
+        return [e for e in evs if e["check"] == "dumbscope_incident"]
+
+    # 1+2: baseline-seed (poll leeg) -> daarna nieuw incident -> precies 1 event
+    steps = [dsresult([]), dsresult([raw_inc("p1")]), dsresult([raw_inc("p1")])]
+    evs, rows, _ = ds_scenario(steps, polls=3)
+    p1 = [e for e in ds_events(evs) if e["fingerprint"] == "dumbscope:p1"]
+    check("DUMBscope nieuw incident -> 1 event", len(p1) == 1 and p1[0]["state"] == "active",
+          str(len(p1)))
+    check("DUMBscope herhaalde poll -> geen nieuw event", len(ds_events(evs)) == 1, str(len(ds_events(evs))))
+    # 3: occurrences 2 -> 3 -> changed event, geen nieuw incident
+    steps = [dsresult([]), dsresult([raw_inc("p1", occ=2)]), dsresult([raw_inc("p1", occ=3)])]
+    evs, rows, _ = ds_scenario(steps, polls=3)
+    occ_ev = [e for e in ds_events(evs) if any(f.startswith("occurrences:") for f in e.get("changed_fields", []))]
+    check("DUMBscope occurrences 2->3 -> changed event",
+          len(occ_ev) == 1 and rows.get("dumbscope:p1", ("", "", 0))[2] == 3, str(occ_ev)[:120])
+    # 4: severity warning -> critical -> escalatie-event
+    steps = [dsresult([]), dsresult([raw_inc("p1", sev="warning")]),
+             dsresult([raw_inc("p1", sev="critical")])]
+    evs, rows, _ = ds_scenario(steps, polls=3)
+    sev_ev = [e for e in ds_events(evs) if any(f.startswith("severity:") for f in e.get("changed_fields", []))]
+    check("DUMBscope severity warning->critical -> escalatie",
+          len(sev_ev) == 1 and sev_ev[0]["severity"] == "critical", str(sev_ev)[:120])
+    # 5: resolve
+    steps = [dsresult([]), dsresult([raw_inc("p1")]), dsresult([raw_inc("p1", status="resolved")])]
+    evs, rows, _ = ds_scenario(steps, polls=3)
+    res_ev = [e for e in ds_events(evs) if e["state"] == "resolved"]
+    check("DUMBscope resolve -> RESOLVED event", len(res_ev) == 1, str(len(res_ev)))
+    # 6: reopen
+    steps = [dsresult([]), dsresult([raw_inc("p1", status="resolved")]),
+             dsresult([raw_inc("p1", status="active", occ=2)])]
+    evs, rows, _ = ds_scenario(steps, polls=3)
+    reop = [e for e in ds_events(evs) if e["state"] == "reopened"]
+    check("DUMBscope reopen -> reopened lifecycle",
+          len(reop) == 1 and rows.get("dumbscope:p1", ("",))[0] == "active", str(reop)[:120])
+    # 7+8: unavailable — anti-flapping en herstel (§12)
+    import hermes_dumbscope as _hd
+    err = _hd.DumbScopeError("unavailable", None, "synthetic")
+    evs, rows, avail = ds_scenario([dsresult([]), err, err], polls=3)
+    check("DUMBscope 2 failures -> nog geen availability-incident", avail is None, str(avail))
+    evs, rows, avail = ds_scenario([dsresult([]), err, err, err], polls=4)
+    check("DUMBscope 3 failures -> availability warning",
+          avail is not None and avail[0] == "active" and avail[1] == "warning", str(avail))
+    evs, rows, avail = ds_scenario([dsresult([]), err, err, err, dsresult([raw_inc("p1")])], polls=5)
+    check("DUMBscope herstel -> availability resolved", avail is not None and avail[0] == "resolved",
+          str(avail))
+    # 9: host-correlatie (geen oorzaak-claim)
+    steps = [dsresult([]), dsresult([raw_inc("plex-degraded")])]
+    evs, rows, _ = ds_scenario(steps, seed_host_warning=True, polls=2)
+    p1 = [e for e in ds_events(evs) if e["fingerprint"] == "dumbscope:plex-degraded"]
+    check("host-correlatie toegevoegd (geen causale claim)",
+          len(p1) == 1 and p1[0].get("host_correlations") == ["host:memory:high"], str(p1)[:140])
+    # 10: onbekende severity -> notice + gemarkeerd
+    steps = [dsresult([]), dsresult([raw_inc("odd", sev="fatal")])]
+    evs, rows, _ = ds_scenario(steps, polls=2)
+    odd = [e for e in ds_events(evs) if e["fingerprint"] == "dumbscope:odd"]
+    check("onbekende severity -> notice + gemarkeerd",
+          len(odd) == 1 and odd[0]["severity"] == "notice" and odd[0].get("severity_unmapped") is True,
+          str(odd)[:120])
 
     fails = [r for r in results if not r[1]]
     for name, okk, detail in results:

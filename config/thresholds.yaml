@@ -88,6 +88,16 @@ recovery:
   good_samples_to_resolve: 2
   note: "WARNING → RECOVERING (eerste goede sample) → RESOLVED (na N goede samples)"
 
+dumbscope:
+  baseline_pending: true
+  base_url: "http://192.168.1.2:8091"
+  username: "remco"
+  timeout_s: 15
+  failure_warning_polls: 3
+  failure_urgent_polls: 12
+  resolved_poll_limit: 20
+  note: "severity-mapping: info->notice, warning->warning, critical->critical; onbekend->notice (gemarkeerd). Wachtwoord uit secrets/dumbscope-admin-password.txt (fallback: arrsight-admin-password.txt); sessie in secrets/dumbscope-session. Alleen GET + login; /api/actions nooit."
+
 docker_daemon:
   baseline_pending: true
   unreachable_severity: critical

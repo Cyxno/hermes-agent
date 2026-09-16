@@ -102,3 +102,34 @@ severity is provisional tot de baseline is goedgekeurd.
 
 Modelrouting/prometheus zijn bewust afwezig: later als optionele provider
 in te haken zonder deze code aan te passen.
+
+## Fase 4 — DUMBscope-integratie (bron A, polling)
+
+`scripts/hermes_dumbscope.py` + `run_dumbscope()` in de fast evaluator (elke
+15 min, failure-isolated). DUMBscope blijft de incident-engine voor alles binnen
+DUMB: Hermes berekent geen service-health, fingerprints, hysteresis of
+root-cause opnieuw.
+
+- **Deployment (waarheid):** DUMBscope 0.7.0 op :8091 (`/api/health` publiek;
+  `/api/incidents` sessie-auth; `/api/agent/events` bestaat niet; `/api/actions`
+  bestaat wél sinds 0.7.0 maar wordt bewust NIET aangeroepen).
+- **Auth:** POST `/api/auth/login` (username+password, Origin-header verplicht,
+  rate-limit 10/15 min) → cookie `dumbscope_session` (TTL 7 d). Wachtwoord uit
+  `secrets/dumbscope-admin-password.txt` (fallback: arrsight-bestand); sessie-
+  token in `secrets/dumbscope-session` (0600). Bij 401 → één re-login per poll.
+  Geen credentials in logs/state/events.
+- **Poll-strategie:** polling, géén SSE. `status=active&limit=200` +
+  `status=resolved&limit=20` dekt new/changed/resolved/reopen; lokaal diffen.
+- **Mapping:** severity info→notice, warning→warning, critical→critical
+  (onbekend→notice, gemarkeerd); lifecycle 1-op-1 overgenomen (DUMBscope kent
+  active/resolved; Hermes verzint geen extra recovery).
+- **State:** `dumbscope_incidents`-tabel (fingerprint=`dumbscope:<source-fp>`,
+  incident-id, status, severity, occurrences, resolved_at, host_correlations)
+  + cursors (`dumbscope:last_poll`, `:failures`, `:seeded`). Eerste poll =
+  baseline-seeding zonder per-incident events.
+- **Availability:** 1–2 mislukte polls = alleen teller; ≥3 → WARNING
+  `dumbscope:availability`; ≥12 → URGENT; herstel → RESOLVED. Host-monitoring
+  draait onafhankelijk door (failure isolation).
+- **Host-correlatie (§13):** actieve host-incidenten (≥warning) worden als
+  `host_correlations` aan DUMBscope-events toegevoegd — gelijktijdigheid, geen
+  oorzaak-claim.
