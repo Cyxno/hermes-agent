@@ -35,6 +35,8 @@ memory:
 
 psi:
   baseline_pending: true
+  unavailable_on_host: true
+  note: "/proc/pressure bestaat niet op deze host (Unraid-kernel zonder PSI); regels blijven inactief, gebruik memory/OOM/load"
   memory_some_avg10_warn: 20
   memory_full_avg10_urgent: 10
   io_full_avg10_warn: 20

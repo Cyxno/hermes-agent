@@ -24,8 +24,9 @@ SSH-identiteiten/authorized_keys alleen bewust wijzigen:
 
 ## Host-sampler (fase 1)
 
-- Handmatig: `/boot/config/plugins/hermes-host-sampler.sh` (met `HERMES_SAMPLER_VERBOSE=1`
-  voor JSON-op stdout).
+- Handmatig: `bash /boot/config/plugins/hermes-host-sampler.sh` (met
+  `HERMES_SAMPLER_VERBOSE=1` voor JSON-op stdout; de flash is noexec, dus altijd
+  via `bash` aanroepen — net als de dispatchers).
 - Cron: user.scripts-entry "Hermes host sampler", `*/5 * * * *` — draait bewust
   ónáfhankelijk van de Hermes-container.
 - DB: `/mnt/user/appdata/hermes/data/homelab/samples.db` (WAL, busy_timeout 5000,
