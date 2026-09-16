@@ -102,9 +102,11 @@ read -r _ _ _ vpct          <<<"$(dfk /mnt/vm_storage)";      vm_pct=$(pct "${vp
 read -r _ _ _ upct          <<<"$(dfk /mnt/user)";            user_pct=$(pct "${upct:-}")
 
 # ---- DB: init, één korte transactie, retentie ---------------------------------
+# insert-or-replace: twee runs binnen dezelfde seconde (alleen bij handmatig
+# hameren; cron staat op */5) overschrijven elkaar dan zonder fout.
 mkdir -p "$(dirname "$DB")"
 if [[ ! -f $DB ]]; then
-  sqlite3 "$DB" <<'SQL'
+  sqlite3 "$DB" >/dev/null <<'SQL'
     pragma journal_mode=wal;
     create table samples(
       ts integer primary key, sampler_ver integer,
@@ -141,10 +143,10 @@ for m in vdisk_pct cache_pct vm_pct logfs_pct rootfs_pct user_pct mem_used_pct \
     from samples where ts >= strftime('%s','now')/3600*3600 and $m is not null;"
 done
 
-if ! out=$(sqlite3 -cmd "pragma busy_timeout=5000" "$DB" 2>&1 <<SQL
+if ! out=$(sqlite3 -cmd '.timeout 5000' "$DB" 2>&1 <<SQL
   pragma synchronous=normal;
   begin;
-  insert into samples values (
+  insert or replace into samples values (
     $(v "$ts"), $(v "$SAMPLER_VER"),
     $(v "$mem_total"), $(v "$mem_used"), $(v "$mem_avail"), $(v "$mem_used_pct"),
     $(v "$psi_mem_some"), $(v "$psi_mem_full"), $(v "$psi_cpu_some"), $(v "$psi_io_some"),
