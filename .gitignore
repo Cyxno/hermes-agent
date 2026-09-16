@@ -1,0 +1,37 @@
+# Secrets — nooit committeren
+.env
+*.env
+.env.*
+!*.env.example
+secrets/
+*secret*
+*.key
+*.pem
+*.p12
+authorized_keys*
+known_hosts*
+
+# State, databases, logs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+logs/
+data/
+test-results/
+*.log
+
+# Backups en tijdelijke artefacten
+*.bak
+*.bak-*
+*.pre-*
+*.orig
+tmp/
+
+# Ontwikkelrommel
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
