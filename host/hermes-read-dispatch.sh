@@ -7,7 +7,7 @@ decode_b64() { printf '%s' "$1" | base64 -d 2>/dev/null || deny "invalid base64 
 valid_since() { [[ ${1:-} =~ ^[0-9]+[smhd]$ ]]; }
 safe_read_path() {
   local p; p=$(realpath -e -- "$1" 2>/dev/null) || deny "path does not exist"
-  case "$p" in */.env|*/.env.*|*.pem|*.key|*.p12|*/secrets/*|*/credentials*|*/authorized_keys|*/operator-state/*) deny "secret or security state is not readable";; esac
+  case "$p" in */.env|*/.env.*|*.pem|*.key|*.p12|*/secrets/*|*/credentials*|*/authorized_keys|*/operator-state/*|*/.ssh/*|*/.ssh) deny "secret or security state is not readable";; esac
   case "$p" in /mnt/user/appdata/*|/mnt/vm_storage/*|/boot/config/plugins/*|/etc/libvirt/*) printf '%s' "$p";; *) deny "path outside read allowlist";; esac
 }
 
@@ -79,7 +79,7 @@ f2_memory_status() {
   oom=$(awk '$1 == "oom_kill" {print $2}' /proc/vmstat 2>/dev/null) || true
   [[ -n ${mt:-} && ${mt:-} -gt 0 && -n ${ma:-} ]] && used_pct=$(( (mt - ma) * 100 / mt ))
   top=$(ps -eo rss,comm,pid --sort=-rss --no-headers 2>/dev/null | head -n 10 |
-        awk '{gsub(/"/,""); printf "%s{\"pid\":%s,\"comm\":\"%s\",\"rss_kb\":%s}", (NR>1?",":""), $3, $2, $1}') || true
+        awk '{gsub(/"/,""); printf "%s{\"pid\":%s,\"comm\":\"%s\",\"rss_kb\":%s}", (seen++?",":""), $3, $2, $1}') || true
   ok memory-status "$(printf '{"mem_total_kb":%s,"mem_avail_kb":%s,"mem_used_pct":%s,"buffers_kb":%s,"cached_kb":%s,"swap_total_kb":%s,"swap_used_kb":%s,"oom_kills_total":%s,"top10_rss":[%s]}' \
     "$(jnum "$mt")" "$(jnum "$ma")" "$used_pct" "$(jnum "$buf")" "$(jnum "$cached")" \
     "$(jnum "${st:-0}")" "$(( ${st:-0} - ${sf:-0} ))" "$(jnum "$oom")" "$top")"
@@ -108,7 +108,7 @@ f2_docker_status() {
   json=$(printf '%s\n' "${rows:-}" | sed 's#^/##' | awk -F'|' 'NF>=7 {
       st=substr($5,1,19);
       printf "%s{\"name\":\"%s\",\"state\":\"%s\",\"health\":\"%s\",\"restarts\":%s,\"started\":\"%s\",\"exit_code\":%s,\"mem_limit_bytes\":%s}",
-        (NR>1?",":""), $1, $2, $3, $4, st, $6, $7}') || true
+        (seen++?",":""), $1, $2, $3, $4, st, $6, $7}') || true
   count=$(printf '%s\n' "${rows:-}" | grep -c .) || true
   ok docker-status "$(printf '{"count":%s,"containers":[%s]}' "${count:-0}" "$json")"
 }
@@ -119,7 +119,7 @@ f2_docker_restarts() {
   json=$(printf '%s\n' "${rows:-}" | sed 's#^/##' | awk -F'|' 'NF>=7 && ($4+0 > 0 || $2 != "running") {
       st=substr($5,1,19);
       printf "%s{\"name\":\"%s\",\"state\":\"%s\",\"restarts\":%s,\"last_start\":\"%s\",\"last_exit_code\":%s}",
-        (NR>1?",":""), $1, $2, $4, st, $6}') || true
+        (seen++?",":""), $1, $2, $4, st, $6}') || true
   ok docker-restarts "$(printf '{"note":"alleen restarts>0 of niet-running","containers":[%s]}' "$json")"
 }
 
@@ -136,9 +136,12 @@ f2_docker_vdisk_status() {
 
 f2_docker_space_detail() {
   local sysdf images
-  sysdf=$(timeout 12 docker system df 2>/dev/null | awk 'NR>1{printf "%s{\"type\":\"%s\",\"total\":%s,\"active\":%s,\"size\":\"%s\",\"reclaimable\":\"%s %s\"}", (NR>1?",":""), $1, $2, $3, $4, $5, $6}') || true
+  sysdf=$(timeout 12 docker system df 2>/dev/null | awk 'NR>1 && NF>=5 {
+      if ($2 ~ /^[0-9]+$/) { ty=$1; tot=$2; act=$3; sz=$4; rec=$5" "$6 }
+      else { ty=$1" "$2; tot=$3; act=$4; sz=$5; rec=$6" "$7 }
+      printf "%s{\"type\":\"%s\",\"total\":%s,\"active\":%s,\"size\":\"%s\",\"reclaimable\":\"%s\"}", (seen++?",":""), ty, tot, act, sz, rec}') || true
   images=$(timeout 10 docker images --format '{{.Size}}|{{.Repository}}:{{.Tag}}' 2>/dev/null | sort -t'|' -k1,1 -rh | head -n 10 |
-           awk -F'|' '{printf "%s{\"size\":\"%s\",\"ref\":\"%s\"}", (NR>1?",":""), $1, $2}') || true
+           awk -F'|' '{printf "%s{\"size\":\"%s\",\"ref\":\"%s\"}", (seen++?",":""), $1, $2}') || true
   ok docker-space-detail "$(printf '{"summary":[%s],"largest_images":[%s],"note":"read-only diagnose; geen cleanup"}' "$sysdf" "$images")"
 }
 
@@ -147,7 +150,7 @@ f2_logfs_status() {
   line=$(df -kP /var/log 2>/dev/null | awk 'NR==2{print $2, $3, $5}') || true
   read -r total used pct <<<"${line:-}"; pct=${pct%\%}
   top=$(du -xk /var/log/* 2>/dev/null | sort -rn | head -n 10 |
-        awk '{printf "%s{\"path\":\"%s\",\"kb\":%s}", (NR>1?",":""), $2, $1}') || true
+        awk '{printf "%s{\"path\":\"%s\",\"kb\":%s}", (seen++?",":""), $2, $1}') || true
   ok logfs-status "$(printf '{"total_kb":%s,"used_kb":%s,"pct":%s,"top10":[%s]}' \
     "$(jnum "$total")" "$(jnum "$used")" "$(jnum "$pct")" "$top")"
 }

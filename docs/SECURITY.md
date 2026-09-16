@@ -40,3 +40,15 @@
 - De operator-allowlist is ruimer dan de v1-documentatie beschreef (compose, VM-beheer,
   file-replace, dangerous-plans); `docs/history/HERMES-SECURITY-v1.md` is daarin
   verouderd — dit document is leidend.
+
+## Fase 2-nawerk
+
+- `safe_read_path` weigert nu ook `*/.ssh/*`: tijdens de fase-2-regressietest
+  bleek `file-read` de agent-read/operator-private keys tóch te kunnen lezen
+  (bestaand gat sinds v1 — de deny-lijst kende alleen extensies als .key/.pem).
+  Gedicht en hertest; beide key-locaties en `.env` worden geweigerd, legitieme
+  file-reads (bv. config.yaml) werken ongewijzigd.
+- Shell-metatekens in het SSH-commando worden nooit geïnterpreteerd: de
+  forced-command dispatcher ontvangt `SSH_ORIGINAL_COMMAND` als één string en
+  splitst op spaties; `status | id` is daardoor een onbekende actie-variant met
+  dode argumenten, geen pipe.

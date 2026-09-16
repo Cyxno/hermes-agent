@@ -48,3 +48,33 @@ Secundair (alleen cache-pool-impact): `du` op `/mnt/cache/system/docker/docker-x
 Ongewijzigd: read-SSH automatisch; operator-SSH uitsluitend na expliciet akkoord;
 plantokens/CONFIRM-DANGEROUS/audit blijven staan; cron/single-query/unattended approvals
 blijven `deny`.
+
+## Fase 2 — read-only SSH-deepchecks (agent-read)
+
+Alle nieuwe acties antwoorden met een JSON-envelope
+`{"ok":true,"action":"…","ts":…,"data":{…}}` of `{"ok":false,…,"error":"…"}`,
+zijn opbouw-gebonden begrensd (< 16 KB) en hebben server-side timeouts
+(docker 10–12 s, smartctl 8 s, overige subseconde). Zware commands zijn
+best-effort; een abort halverwege levert een fail-envelope, nooit halve JSON.
+
+| Actie | Inhoud | Waarom geen duplicaat van de 5-min-sampler |
+|---|---|---|
+| host-summary | uptime, kernel, load, RAM, docker-ok, array-state, 6 mounts | één keer bij diagnose; sampler blijft de history-leverancier |
+| memory-status | totals, buffers/cache, swap, OOM-teller, top-10 RSS | top-processen en cper-container RSS zijn te duur voor elke 5 min |
+| oom-events [since] | OOM-regels uit dmesg + cumulatieve teller | gebeurtenissen, geen meting; alleen bij verdenking |
+| docker-status | per container: state/health/restarts/started/exit/memlimit | één inspect-batch on-demand; sampler houdt alleen states-teller |
+| docker-restarts | subset: restarts>0 of niet-running | trendsignaal voor de evaluator, niet per 5 min nodig |
+| docker-vdisk-status | df op loop-mount (GUI-authoritatief) + du-allocatie | bevestiging/detail; primaire serie komt van de sampler |
+| docker-space-detail | docker system df + 10 grootste images | zwaar (≈0,5 s, alle lagen); alleen on-demand bij groei |
+| logfs-status | df + top-10 du van /var/log | detailachtervolging bij groei; sampler houdt alleen % |
+| pool-status | cache/vm_storage/user: fstype, rw, pct | ro-remount/fstype-detail hoort niet in het 5-min-pad |
+| disk-health [dev] | SMART: health, temp, realloc(5/196), pending(197), uncorrectable(198), media-errors, ssd-life(231/NVMe-%used) | standby-aware (`-n standby` wekt nooit); volledige poll per 5 min zou disks wakker houden |
+| temperature-status | package/core-max + SSD-temps | momentopname ter bevestiging; sampler heeft de trend |
+| array-status | mdState, sbSynced (epoch!), resync-actie/% | mdcmd-status is diagnose, geen timeserie |
+| kernel-errors [since] | gefilterd: I/O, XFS/BTRFS/EXT4, ro-remount, NVMe, MCE, hangs | event-detectie met venster, geen meting |
+| fs-errors [since] | filesystem-specifieke regels | idem |
+
+Semantiek-opmerkingen: `wear_pct` is bij NVMe "Percentage Used" (slijtage) en bij
+ATA attr 231 "SSD_Life_Left" (restleven) — evaluator interpreteert per bron.
+`parity_synced` in array-status is een epoch-tijdstip van de laatste sync.
+PSI bestaat niet op deze host (kernel zonder PSI) en wordt nergens verwacht.
