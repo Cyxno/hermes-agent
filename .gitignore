@@ -35,3 +35,7 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+
+# uitzondering: de secretscan-tool zelf
+!tools/
+!tools/check-secrets.sh

@@ -1,0 +1,100 @@
+# thresholds.yaml — deterministische drempels voor de Hermes-evaluator.
+#
+# STATUS: ALLE PROFIELEN STAAN OP baseline_pending: true.
+# De waarden hieronder zijn conservatieve safety-limits.
+# Na 24-48 uur dry-run levert `hermes_evaluator.py baseline-report` min/p50/p95/p99/max
+# per metriek; goedgekeurde banden worden hier ingevuld en krijgen
+# baseline_pending: false. Aanpassen = dit bestand wijzigen, geen codewijziging.
+#
+# Semantiek per profiel:
+#   notice/warning/urgent/critical = drempel voor binnenkomst van de band
+#   exit_margin                    = hysteresis-uitgang (drempel - margin)
+#   sustained_samples              = aantal opeenvolgende 5-min-samples boven drempel
+#   rise_rate_per_hour             = extra versnelling (+1 severity-niveau)
+#
+# Overkoepelend: OOM-kill event, read-only remount of niet-gemounte Docker-vDisk
+# zijn ALTIJD direct CRITICAL, onafhankelijk van deze banden.
+# Swap-activering alleen is maximaal WARNING (host heeft standaard geen swap).
+
+version: 1
+
+defaults:
+  baseline_pending: true
+  sustained_samples: 2
+  exit_margin_pp: 5
+  flap_cooldown_minutes: 30
+
+memory:
+  baseline_pending: true
+  warn_pct: 90
+  urgent_pct: 95
+  critical_pct: 97
+  critical_when_oom: true
+  rise_rate_pct_per_hour: 5
+  note: "available-mem weegt mee; PSI bepaalt onderscheid warning vs urgent"
+
+psi:
+  baseline_pending: true
+  memory_some_avg10_warn: 20
+  memory_full_avg10_urgent: 10
+  io_full_avg10_warn: 20
+
+swap:
+  baseline_pending: true
+  appear_severity: notice
+  used_kb_warn: 262144
+  critical_only_with_oom_or_psi: true
+
+docker_vdisk:
+  baseline_pending: true
+  warn_pct: 85
+  urgent_pct: 90
+  critical_pct: 95
+  growth_warn_gb_per_24h: 2
+  source: "df -kP /var/lib/docker (loop2, xfs) = GUI-authoritatief"
+  not_mounted_severity: critical
+
+logfs:
+  baseline_pending: true
+  warn_pct: 70
+  urgent_pct: 85
+  critical_pct: 95
+
+storage:
+  baseline_pending: true
+  warn_pct: 80
+  urgent_pct: 88
+  critical_pct: 94
+  applies_to: [cache, vm_storage, rootfs, user_share]
+
+temperatures:
+  baseline_pending: true
+  package_warn_c: 90
+  package_urgent_c: 95
+  package_critical_c: 100
+  ssd_warn_c: 60
+  ssd_urgent_c: 70
+  sustained_minutes_warn: 60
+
+docker_daemon:
+  baseline_pending: true
+  unreachable_severity: critical
+  unexpected_exit_warn: true
+  restart_loop_min_restarts: 3
+  restart_loop_window_minutes: 15
+
+array_disks:
+  baseline_pending: true
+  # Alleen in de hourly/deep laag (smartctl); sampler raakt arraydisks niet.
+  pending_sector_warn: 1
+  reallocated_growth_critical: true
+  temp_warn_c: 50
+  temp_urgent_c: 55
+
+alerts:
+  baseline_pending: true
+  notice_send: false
+  warning_send_new_or_worse: true
+  urgent_send_immediately: true
+  critical_send_immediately: true
+  resolved_send_once: true
