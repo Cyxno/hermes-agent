@@ -55,10 +55,13 @@ for entry in "${MAP[@]}"; do
     status="DIFFERS"; action="update"
   fi
   if [[ $status == SAME ]]; then
-    # rechten/owner alsnog handhaven (idempotentie)
+    # rechten/owner handhaven (idempotentie). De flash (/boot) is vfat: modes
+    # worden daar door de mount-mask bepaald, dus alleen uid afdwingen.
     cur_mode=$(stat -c %a "$dst"); cur_uid=$(stat -c %u "$dst")
-    if [[ $cur_mode != "$mode" || $cur_uid != "$uid" ]]; then
-      status="META"; action="chmod/chown $mode/$uid"
+    if [[ $cur_uid != "$uid" ]]; then
+      status="META"; action="chown $uid"
+    elif [[ $dst != /boot/* && $cur_mode != "$mode" ]]; then
+      status="META"; action="chmod $mode"
     fi
   fi
   printf '%-42s %-8s %s\n' "$src" "$status" "$dst"
