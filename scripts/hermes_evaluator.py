@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""hermes_evaluator.py — deterministische evaluator (fase 3, DRY-RUN).
+
+Modes:
+  fast             samples.db -> trends/severity/incident-state (geen SSH);
+                   replayt nieuwe samples met cursor (catch-up na downtime)
+  deep             fast-regels zijn al gedraaid; hier read-only SSH deep checks
+                   (disk-health, array, docker, pool, kernel/fs errors;
+                   docker-space-detail alleen bij actief groei-incident,
+                   oom-events alleen bij OOM-delta)
+  baseline-report  per metriek min/p50/p95/p99/max + suggested thresholds
+  test             synthetische cases (tempdirs; zelfde codepad als productie)
+
+DRY-RUN: geen LLM, geen Telegram, geen remediation, geen DUMBscope, geen
+Prometheus. Output: agent_state.db + evaluator-events.jsonl (alleen lokaal log).
+"""
+import json, hashlib, math, os, re, shutil, sqlite3, statistics, subprocess, sys, tempfile, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+DRY_RUN = True  # fase 3: dit bestand bevat structureel geen LLM/Telegram/remediation
+
+HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+HL = HOME / "homelab"
+SAMPLES_DB = HL / "samples.db"
+STATE_DB = HL / "agent_state.db"
+EVENTS = HL / "evaluator-events.jsonl"
+THRESHOLDS = HOME / "thresholds.yaml"
+
+LEVELS = {"normal": 0, "notice": 1, "warning": 2, "urgent": 3, "critical": 4}
+NAME = {v: k for k, v in LEVELS.items()}
+RUN_ID = uuid.uuid4().hex[:12]
+
+# ---------------------------------------------------------------- mini-yaml --
+def mini_yaml(text):
+    """Beperkte parser voor thresholds.yaml: nesting op indent, scalairen,
+    inline-lijsten [a, b], comments. Geen anchors/geneste lijsten."""
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        line = re.sub(r"#.*$", "", raw).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, _, val = line.strip().partition(":")
+        key, val = key.strip(), val.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if val == "":
+            parent[key] = {}
+            stack.append((indent, parent[key]))
+        elif val.startswith("[") and val.endswith("]"):
+            parent[key] = [v.strip().strip("'\"") for v in val[1:-1].split(",") if v.strip()]
+        elif val.lower() in ("true", "false"):
+            parent[key] = val.lower() == "true"
+        else:
+            try:
+                parent[key] = int(val)
+            except ValueError:
+                try:
+                    parent[key] = float(val)
+                except ValueError:
+                    parent[key] = val.strip("'\"")
+    return root
+
+def load_cfg():
+    cfg = mini_yaml(THRESHOLDS.read_text()) if THRESHOLDS.exists() else {}
+    cfg.setdefault("defaults", {"exit_margin_pp": 5, "sustained_samples": 2})
+    cfg.setdefault("recovery", {"good_samples_to_resolve": 2})
+    return cfg
+
+def cfg_recovery(cfg):
+    return int(cfg.get("recovery", {}).get("good_samples_to_resolve", 2))
+
+# ------------------------------------------------------------------- state --
+def state_db():
+    c = sqlite3.connect(STATE_DB, timeout=10)
+    c.execute("pragma journal_mode=wal")
+    c.execute("pragma busy_timeout=5000")
+    c.execute("pragma synchronous=normal")
+    c.executescript("""
+    create table if not exists incidents(
+      fingerprint text primary key, source text, type text, state text,
+      current_severity text, previous_severity text,
+      first_seen text, last_seen text, last_changed text, resolved_at text,
+      occurrences integer default 1, last_value real, peak_value real,
+      last_alert_at text, suppression_until text,
+      good_samples integer default 0, last_reason text);
+    create table if not exists metric_state(
+      metric text primary key, last_value real, previous_value real, last_ts text,
+      trend text, slope real, sustained_since text, peak real, baseline_pending integer);
+    create table if not exists counters(
+      name text primary key, device text, previous_value real, current_value real,
+      delta real, last_checked text);
+    create table if not exists cursors(
+      name text primary key, value text, last_checked text);
+    """)
+    return c
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def emit(mode, check, fp, *, current=None, previous=None, trend=None, mn=None, mx=None,
+         severity="normal", provisional=True, state="observed", baseline_pending=True,
+         reason="", recommended_diagnostic=None, source="fast", sample_ts=None):
+    row = {"ts": now_iso(), "run_id": RUN_ID, "mode": mode, "check": check,
+           "fingerprint": fp, "current": current, "previous": previous,
+           "trend": trend or {}, "min24": mn, "max24": mx, "severity": severity,
+           "state": state, "baseline_pending": baseline_pending,
+           "provisional": provisional, "reason": reason,
+           "recommended_diagnostic": recommended_diagnostic, "source": source,
+           "sample_ts": sample_ts, "dry_run": DRY_RUN}
+    with EVENTS.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
+    """Deterministische incident-state-machine -> (state, event_type)."""
+    now = now_iso()
+    sev = NAME[sev_level]
+    row = c.execute("select state, current_severity, occurrences, peak_value from incidents"
+                    " where fingerprint=?", (fp,)).fetchone()
+    if row is None:
+        if sev_level <= 0:
+            return "none", "none"  # normal is geen incident
+        c.execute("insert into incidents(fingerprint, source, type, state, current_severity,"
+                  " previous_severity, first_seen, last_seen, last_changed, occurrences,"
+                  " last_value, peak_value, last_alert_at, last_reason)"
+                  " values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (fp, source, itype, "active", sev, "normal", now, now, now, 1,
+                   value, value, now, reason))
+        return "active", "new"
+    state, cur_sev, occ, peak = row[0], row[1], row[2], row[3]
+    if sev_level <= 0 and state in ("active", "recovering"):
+        # non-pct regels: eerste goede waarde lost direct op (pct heeft eigen recovery-pad)
+        c.execute("update incidents set state='resolved', current_severity='normal',"
+                  " previous_severity=?, last_changed=?, resolved_at=?, good_samples=0,"
+                  " last_reason=? where fingerprint=?",
+                  (cur_sev, now, now, "opgelost: waarde terug op normaal", fp))
+        return "resolved", "resolved"
+    prev_level = LEVELS.get(cur_sev, 0)
+    peak = max(peak or 0, value or 0)
+    if state == "resolved":
+        if sev_level >= 2:
+            c.execute("update incidents set state='active', current_severity=?, previous_severity=?,"
+                      " occurrences=occurrences+1, last_seen=?, last_changed=?, resolved_at=NULL,"
+                      " good_samples=0, peak_value=?, last_value=?, last_reason=? where fingerprint=?",
+                      (sev, cur_sev, now, now, peak, value, reason, fp))
+            return "active", "reopened"
+        c.execute("update incidents set last_seen=?, last_value=? where fingerprint=?", (now, value, fp))
+        return "resolved", "none"
+    if state == "recovering":
+        if sev_level >= 2:
+            c.execute("update incidents set state='active', current_severity=?, previous_severity=?,"
+                      " occurrences=occurrences+1, last_seen=?, last_changed=?, good_samples=0,"
+                      " peak_value=?, last_value=?, last_reason=? where fingerprint=?",
+                      (sev, cur_sev, now, now, peak, value, reason, fp))
+            return "active", "escalated"
+        c.execute("update incidents set last_seen=?, last_value=? where fingerprint=?", (now, value, fp))
+        return "recovering", "none"
+    # active
+    if sev_level > prev_level:
+        c.execute("update incidents set current_severity=?, previous_severity=?, last_seen=?,"
+                  " last_changed=?, peak_value=?, last_value=?, last_reason=? where fingerprint=?",
+                  (sev, cur_sev, now, now, peak, value, reason, fp))
+        return "active", "escalated"
+    c.execute("update incidents set last_seen=?, last_value=?, peak_value=?, last_reason=? where fingerprint=?",
+              (now, value, peak, reason, fp))
+    return "active", "none"
+
+# ------------------------------------------------------------------ trends --
+def fetch_series(metric, hours=24):
+    if not SAMPLES_DB.exists():
+        return []
+    try:
+        c = sqlite3.connect(f"file:{SAMPLES_DB}?mode=ro", uri=True, timeout=10)
+        rows = c.execute(
+            f"select ts, {metric} from samples where {metric} is not null and ts >= ?"
+            " order by ts", (int(datetime.now(timezone.utc).timestamp()) - hours * 3600,)).fetchall()
+        c.close()
+    except sqlite3.OperationalError:
+        return []
+    return [(float(t), float(v)) for t, v in rows]
+
+def nearest(points, target, tol=180):
+    best_v, best_d = None, None
+    for ts, v in points:
+        d = abs(ts - target)
+        if d <= tol and (best_d is None or d < best_d):
+            best_v, best_d = v, d
+    return best_v
+
+def trend_of(points, eps=0.5):
+    if not points:
+        return {}
+    now_ts, cur = points[-1]
+    d = {"current": cur}
+    for key, secs in (("d15m", 900), ("d1h", 3600), ("d6h", 21600)):
+        v = nearest(points, now_ts - secs)
+        d[key] = round(cur - v, 3) if v is not None else None
+    win = [p for p in points if now_ts - p[0] <= 3900][-12:]
+    slope = None
+    if len(win) >= 3:
+        x = [(p[0] - win[0][0]) / 3600 for p in win]
+        y = [p[1] for p in win]
+        mx, my = statistics.mean(x), statistics.mean(y)
+        den = sum((a - mx) ** 2 for a in x)
+        slope = sum((a - mx) * (b - my) for a, b in zip(x, y)) / den if den else 0.0
+    d["slope_per_h"] = round(slope, 3) if slope is not None else None
+    d["direction"] = ("rising" if (slope or 0) > eps else
+                      "falling" if (slope or 0) < -eps else "stable")
+    d["min24"] = min(p[1] for p in points)
+    d["max24"] = max(p[1] for p in points)
+    return d
+
+def sustained_above(points, threshold, max_gap=660):
+    n, last_ts = 0, None
+    for ts, v in reversed(points):
+        if v is None or v < threshold:
+            break
+        if last_ts is not None and last_ts - ts > max_gap:
+            break
+        n += 1
+        last_ts = ts
+    return n
+
+# --------------------------------------------------------------- band-regel --
+def band_level(value, th):
+    if value >= th.get("critical_pct", 10**9): return 4
+    if value >= th.get("urgent_pct", 10**9): return 3
+    if value >= th.get("warn_pct", 10**9): return 2
+    return 0
+
+def eval_band(value, th, sustained, need, rising_fast, cap_notice_first=False, slope=None):
+    """Deterministisch: crit altijd; urgent bij sustain of rising_fast; warning
+    bij sustain of rising_fast; allereerste breach-sample -> notice (cap).
+    lvl 2 + snel stijgend + nabij urgent -> urgent (§7)."""
+    lvl = band_level(value, th)
+    bits = []
+    if lvl == 4:
+        return 4, False, [f">=critical({th.get('critical_pct')})"]
+    if cap_notice_first and sustained < 2 and lvl >= 1:
+        return 1, True, [f"eerste breach-sample ({value}) -> notice (cap, §7)"]
+    if lvl == 3:
+        if sustained >= need:
+            return 3, False, [f">=urgent sustained({sustained})"]
+        if rising_fast:
+            return 3, True, [">=urgent + rising_fast"]
+        return 2, True, [">=urgent single sample -> warning provisional"]
+    if lvl == 2:
+        if sustained >= need:
+            return 2, False, [f">=warn sustained({sustained})"]
+        if rising_fast:
+            urgent_at = th.get("urgent_pct")
+            if urgent_at is not None and value >= urgent_at - 2 and (slope or 0) >= float(th.get("rise_urgent_ppc_per_hour", 5)):
+                return 3, True, [">=warn + snel stijgend richting urgent"]
+            return 2, True, [">=warn + rising_fast"]
+        return 1, True, [">=warn single sample -> notice"]
+    return 0, False, []
+
+def exit_threshold(sev_level, th, margin=5):
+    table = {1: th.get("warn_pct"), 2: th.get("warn_pct"), 3: th.get("urgent_pct"),
+             4: th.get("critical_pct")}
+    v = table.get(sev_level)
+    return (v - margin) if v is not None else None
+
+# -------------------------------------------------------------- pct-metriek --
+def metric_state_update(c, metric, value, trend, baseline_pending=True):
+    c.execute("insert into metric_state(metric, last_value, previous_value, last_ts, trend,"
+              " slope, sustained_since, peak, baseline_pending) values(?,?,?,?,?,?,?,?,?)"
+              " on conflict(metric) do update set previous_value=metric_state.last_value,"
+              " last_value=excluded.last_value, last_ts=excluded.last_ts, trend=excluded.trend,"
+              " slope=excluded.slope,"
+              " peak=max(coalesce(metric_state.peak, excluded.last_value), excluded.last_value)",
+              (metric, value,
+               trend.get("d15m") if trend else None, now_iso(),
+               (trend or {}).get("direction"), (trend or {}).get("slope_per_h"), None,
+               value, 1 if baseline_pending else 0))
+
+def pct_metric(c, cfg, events, *, fp, metric, label, th, sustain_need, value, points,
+               trend, rising_fast=False, cap_notice_first=False, eps=0.5, mode="fast",
+               sample_ts=None, source="fast"):
+    """Bands + hysteresis + recovery voor één pct-metriek op één sample."""
+    bp = bool(th.get("baseline_pending", True))
+    margin = int(cfg.get("defaults", {}).get("exit_margin_pp", 5))
+    need_resolve = cfg_recovery(cfg)
+    metric_state_update(c, metric, value, trend, bp)
+    row = c.execute("select state, current_severity, good_samples from incidents"
+                    " where fingerprint=?", (fp,)).fetchone()
+    prev_state = row[0] if row else "observed"
+    prev_sev = LEVELS.get(row[1], 0) if row else 0
+    good = (row[2] if row else 0) or 0
+    sust = sustained_above(points, th.get("warn_pct", 10**9))
+    lvl, prov, bits = eval_band(value, th, sust, sustain_need, rising_fast, cap_notice_first,
+                                slope=(trend or {}).get("slope_per_h"))
+
+    if row and prev_state in ("active", "recovering"):
+        exit_at = exit_threshold(prev_sev, th, margin)
+        if lvl < prev_sev:
+            if exit_at is not None and value < exit_at:
+                good += 1
+                if good >= need_resolve:
+                    c.execute("update incidents set state='resolved', current_severity='normal',"
+                              " previous_severity=?, last_seen=?, last_changed=?, resolved_at=?,"
+                              " good_samples=0, last_reason=? where fingerprint=?",
+                              (NAME[prev_sev], now_iso(), now_iso(), now_iso(),
+                               f"recovery: {good} goede samples < exit {exit_at}", fp))
+                    events.append(emit(mode, label, fp, current=value, trend=trend, severity="normal",
+                                       provisional=bp, state="resolved", baseline_pending=bp,
+                                       reason=f"hersteld: {good} goede samples < exit {exit_at}",
+                                       source=source, sample_ts=sample_ts))
+                    return "normal", True
+                sev_name = NAME[max(prev_sev - 1, 1)]
+                c.execute("update incidents set state='recovering', current_severity=?, good_samples=?,"
+                          " last_seen=?, last_value=?, last_reason=? where fingerprint=?",
+                          (sev_name, good, now_iso(), value, f"recovering ({good}/{need_resolve})", fp))
+                events.append(emit(mode, label, fp, current=value, trend=trend, severity=sev_name,
+                                   provisional=bp, state="recovering", baseline_pending=bp,
+                                   reason=f"herstel bezig ({good}/{need_resolve} goede samples)",
+                                   source=source, sample_ts=sample_ts))
+                return sev_name, True
+            bits.append("hysteresis: binnen marge, severity gehouden")
+            lvl = prev_sev
+        elif lvl == prev_sev:
+            bits.append("hysteresis: severity gehouden")
+
+    name, etype = incident_upsert(c, fp, source=source, itype=metric, sev_level=lvl,
+                                  value=value, reason="; ".join(bits) or "normal")
+    if etype in ("new", "escalated", "reopened") or (lvl >= 1 and prov):
+        events.append(emit(mode, label, fp, current=value, trend=trend, severity=NAME[lvl],
+                           provisional=prov and bp, state=name, baseline_pending=bp,
+                           reason="; ".join(bits) or f"{label}={value}",
+                           source=source, sample_ts=sample_ts))
+    return NAME[lvl], prov
+
+# -------------------------------------------------------------------- fast --
+PCT_RULES_FAST = [
+    ("mem_used_pct", "host:memory:high", "memory", "memory", 0.5),
+    ("vdisk_pct", "host:docker_vdisk:high", "docker_vdisk", "docker_vdisk", 0.3),
+    ("logfs_pct", "host:logfs:high", "logfs", "logfs", 0.5),
+    ("cache_pct", "host:cache:high", "cache", "storage", 0.3),
+    ("vm_pct", "host:vm_storage:high", "vm_storage", "storage", 0.3),
+    ("user_pct", "host:user_share:high", "user_share", "storage", 0.3),
+    ("rootfs_pct", "host:rootfs:high", "rootfs", "storage", 0.3),
+    ("package_temp_c", "host:temperature:package", "package_temp", "temperatures", 1.0),
+    ("core_max_temp_c", "host:temperature:core", "core_temp", "temperatures", 1.0),
+]
+CAP_NOTICE_METRICS = {"package_temp_c", "core_max_temp_c"}
+
+def run_fast(cfg, events):
+    c = state_db()
+    need = int(cfg.get("defaults", {}).get("sustained_samples", 2))
+    st = {}
+    series = {m: fetch_series(m) for m, *_ in PCT_RULES_FAST}
+    series["vdisk_used_kb"] = fetch_series("vdisk_used_kb")
+
+    row = c.execute("select value from cursors where name='fast:last_ts'").fetchone()
+    last_ts = int(float(row[0])) if row else 0
+    all_ts = sorted({ts for s in series.values() for ts, _ in s})
+    new_ts = [ts for ts in all_ts if ts > last_ts]
+
+    for ts in new_ts:
+        points = {m: [p for p in s if p[0] <= ts] for m, s in series.items()}
+        for metric, fp, label, sect, eps in PCT_RULES_FAST:
+            pts = points[metric]
+            if not pts or pts[-1][0] != ts:
+                continue
+            tr = trend_of(pts, eps=eps)
+            th = dict(cfg.get(sect, {}))
+            sneed = need
+            if sect == "temperatures":
+                # band-engine verwacht warn_pct/urgent_pct/critical_pct
+                th["warn_pct"] = th.get("package_warn_c")
+                th["urgent_pct"] = th.get("package_urgent_c")
+                th["critical_pct"] = th.get("package_critical_c")
+                sneed = max(1, math.ceil(int(th.get("sustained_minutes", 15)) / 5))
+            rising_fast = ((tr.get("slope_per_h") or 0) >=
+                           float(th.get("rise_rate_pct_per_hour", th.get("rise_urgent_ppc_per_hour", 5))))
+            sev, prov = pct_metric(c, cfg, events, fp=fp, metric=metric, label=label, th=th,
+                                   sustain_need=sneed, value=tr["current"], points=pts, trend=tr,
+                                   rising_fast=rising_fast,
+                                   cap_notice_first=metric in CAP_NOTICE_METRICS,
+                                   eps=eps, mode="fast", sample_ts=ts)
+            st[label] = sev
+
+    # vDisk-groei: delta 1h/24h op vdisk_used_kb (alleen laatste stand)
+    kb = series["vdisk_used_kb"]
+    if len(kb) >= 2:
+        tr = trend_of(kb, eps=200 * 1024)
+        limit = float(cfg.get("docker_vdisk", {}).get("growth_warn_gb_per_24h", 2)) * 1024**2
+        d1h, d24h = tr.get("d1h"), tr.get("d24h")
+        eff = max(x or 0 for x in (d1h * 24 if d1h is not None else 0, d24h or 0))
+        lvl = 2 if eff > limit else 0
+        _, etype = incident_upsert(c, "host:docker_vdisk:growth", source="fast", itype="vdisk_growth",
+                                   sev_level=lvl, value=round(eff / 1024**2, 2),
+                                   reason=f"d1h={d1h}KB d24h={d24h}KB limit={int(limit)}KB",
+                                   )
+        if etype in ("new", "escalated"):
+            events.append(emit("fast", "docker_vdisk_growth", "host:docker_vdisk:growth",
+                               current=round(eff / 1024**2, 2), trend={"d1h_kb": d1h, "d24h_kb": d24h},
+                               severity=NAME[lvl], provisional=True, state="active", baseline_pending=True,
+                               reason="groei > growth_warn_gb_per_24h (24u of geëxtrapoleerd uit 1u)",
+                               recommended_diagnostic="docker-space-detail"))
+        elif etype == "resolved":
+            events.append(emit("fast", "docker_vdisk_growth", "host:docker_vdisk:growth",
+                               current=round(eff / 1024**2, 2), severity="normal", provisional=True,
+                               state="resolved", baseline_pending=True, reason="groei terug onder grens"))
+        metric_state_update(c, "vdisk_growth_kb24", round(eff / 1024**2, 2), tr)
+
+    # /var/log-groei: klein tmpfs, snelle groei weegt extra zwaar (§9)
+    # eff_rate = max(OLS-slope, 15-min-delta x 4): stapsgroei wordt niet weggedrukt
+    lpts = series["logfs_pct"]
+    if len(lpts) >= 3:
+        ltr = trend_of(lpts, eps=0.5)
+        glimit = float(cfg.get("logfs", {}).get("growth_warn_pp_per_hour", 5))
+        eff_rate = max(ltr.get("slope_per_h") or 0, (ltr.get("d15m") or 0) * 4)
+        glvl = 2 if eff_rate >= glimit else 0
+        _, etype = incident_upsert(c, "host:logfs:growth", source="fast", itype="logfs_growth",
+                                   sev_level=glvl, value=round(eff_rate, 2),
+                                   reason=f"groeirate {round(eff_rate,2)}pp/h >= {glimit}pp/h")
+        if etype in ("new", "escalated"):
+            events.append(emit("fast", "logfs_growth", "host:logfs:growth", current=round(eff_rate, 2),
+                               trend=ltr, severity=NAME[glvl], provisional=True, state="active",
+                               baseline_pending=True, reason="snelle groei klein filesystem",
+                               recommended_diagnostic="logfs-status"))
+        elif etype == "resolved":
+            events.append(emit("fast", "logfs_growth", "host:logfs:growth", current=round(eff_rate, 2),
+                               severity="normal", provisional=True, state="resolved",
+                               baseline_pending=True, reason="groei terug onder grens"))
+        metric_state_update(c, "logfs_growth_pph", ltr.get("slope_per_h"), ltr)
+
+    # OOM monotone counter (primaire bron: sampler /proc/vmstat)
+    oom = fetch_series("oom_kills", 3)
+    if oom:
+        cur = oom[-1][1]
+        row = c.execute("select current_value from counters where name='oom_kills'").fetchone()
+        prev = row[0] if row else cur  # eerste waarneming = baseline
+        delta = cur - prev
+        c.execute("insert into counters(name, device, previous_value, current_value, delta,"
+                  " last_checked) values('oom_kills','host',?,?,?,?) on conflict(name) do update"
+                  " set previous_value=counters.current_value, current_value=excluded.current_value,"
+                  " delta=excluded.delta, last_checked=excluded.last_checked",
+                  (prev, cur, delta, now_iso()))
+        if delta > 0:
+            sev_name = cfg.get("memory", {}).get("oom_event_severity", "critical")
+            _, etype = incident_upsert(c, "host:memory:oom", source="fast", itype="oom",
+                                       sev_level=LEVELS[sev_name], value=delta,
+                                       reason=f"oom_kills {int(prev)} -> {int(cur)}", )
+            if etype in ("new", "escalated"):
+                events.append(emit("fast", "oom", "host:memory:oom", current=int(cur), previous=int(prev),
+                                   severity=sev_name, provisional=True, state="active",
+                                   baseline_pending=True, reason=f"OOM-teller +{delta}",
+                                   recommended_diagnostic="oom-events"))
+        st["oom_kills"] = int(cur)
+
+    # docker daemon down (sampler), swap, unhealthy-teller: laatste sample
+    for metric, fp, label, lvl0, reason in (
+            ("docker_ok", "host:docker_daemon:down", "docker_daemon", 4, "docker daemon onbereikbaar"),
+            ("containers_unhealthy", "host:containers:unhealthy", "containers_unhealthy", 1,
+             "unhealthy containers aanwezig")):
+        pts = fetch_series(metric, 1)
+        if pts and pts[-1][1] == (0 if metric == "docker_ok" else pts[-1][1]) and \
+           ((metric == "docker_ok" and pts[-1][1] == 0) or (metric != "docker_ok" and pts[-1][1] > 0)):
+            value = pts[-1][1]
+            _, etype = incident_upsert(c, fp, source="fast", itype=metric, sev_level=lvl0,
+                                       value=value, reason=reason, )
+            if etype in ("new", "escalated"):
+                events.append(emit("fast", label, fp, current=value, severity=NAME[lvl0],
+                                   provisional=True, state="active", baseline_pending=True,
+                                   reason=reason, source="fast"))
+    sw = fetch_series("swap_used_kb", 1)
+    if sw and sw[-1][1] > 0:
+        lvl = 2 if sw[-1][1] > int(cfg.get("swap", {}).get("used_kb_warn", 262144)) else 1
+        _, etype = incident_upsert(c, "host:swap:active", source="fast", itype="swap",
+                                   sev_level=lvl, value=sw[-1][1],
+                                   reason="swap actief (host heeft standaard geen swap)", )
+        if etype in ("new", "escalated"):
+            events.append(emit("fast", "swap", "host:swap:active", current=sw[-1][1],
+                               severity=NAME[lvl], provisional=True, state="active",
+                               baseline_pending=True, reason="swap verscheen onverwacht"))
+
+    if new_ts:
+        c.execute("insert into cursors(name, value, last_checked) values('fast:last_ts', ?, ?)"
+                  " on conflict(name) do update set value=excluded.value, last_checked=excluded.last_checked",
+                  (str(int(new_ts[-1])), now_iso()))
+    active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
+    c.commit(); c.close()
+    return {"mode": "fast", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
+            "samples_replayed": len(new_ts), "incidents_active": active,
+            "dry_run": DRY_RUN, **{f"sev_{k}": v for k, v in st.items()}}
+
+# -------------------------------------------------------------------- deep --
+SSH_KEY = HOME / "home/.ssh/agent-read"
+SSH_KH = HOME / "home/.ssh/known_hosts"
+SSH_HOST = "192.168.1.2"
+
+def ssh_action(action, *args, timeout=45):
+    cmd = ["ssh", "-i", str(SSH_KEY), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+           "-o", "UserKnownHostsFile=" + str(SSH_KH), "-o", "ConnectTimeout=10",
+           f"root@{SSH_HOST}", action, *args]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            return {"ok": False, "error": f"ssh exit {p.returncode}: {p.stderr[:120]}"}
+        return json.loads(p.stdout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timeout {timeout}s"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+def counter(c, name, device, value):
+    row = c.execute("select current_value from counters where name=?", (name,)).fetchone()
+    prev = row[0] if row else value  # eerste waarneming = baseline, geen delta-event
+    delta = value - prev
+    c.execute("insert into counters(name, device, previous_value, current_value, delta,"
+              " last_checked) values(?,?,?,?,?,?) on conflict(name) do update set"
+              " previous_value=counters.current_value, current_value=excluded.current_value,"
+              " delta=excluded.delta, last_checked=excluded.last_checked",
+              (name, device, prev, value, delta, now_iso()))
+    return prev, delta
+
+def line_fingerprint(line):
+    norm = re.sub(r"\d+", "N", line.lower())
+    norm = re.sub(r"\[[^\]]*\]", "", norm)
+    return hashlib.sha1(norm.encode()).hexdigest()[:16]
+
+def run_deep(cfg, events):
+    c = state_db()
+    st = {}
+
+    # disk-health: health + monotone counters (§12)
+    dh = ssh_action("disk-health")
+    if dh.get("ok"):
+        for d in dh["data"]:
+            dev = d["device"]
+            if d.get("state") == "standby":
+                continue  # slapende disk: counters NIET aanraken (geen vals reset-signaal)
+            if (d.get("health") or "").upper() not in ("PASSED", "OK", ""):
+                _, etype = incident_upsert(c, f"disk:{dev}:smart_failed", source="deep", itype="smart",
+                                           sev_level=4, value=0,
+                                           reason=f"health={d.get('health')}", )
+                if etype in ("new", "escalated"):
+                    events.append(emit("deep", "disk_health", f"disk:{dev}:smart_failed",
+                                       current=d.get("health"), severity="critical", provisional=True,
+                                       state="active", baseline_pending=True,
+                                       reason=f"SMART health {d.get('health')}", source="deep"))
+            for field, short in (("crc_errors", "crc"), ("reallocated", "reallocated"),
+                                 ("pending", "pending"), ("offline_uncorrectable", "offline_unc"),
+                                 ("media_errors", "media_errors")):
+                v = d.get(field)
+                if v is None:
+                    continue
+                prev, delta = counter(c, f"smart:{dev}:{short}", dev, v)
+                if short == "pending" and v > 0:
+                    _, etype = incident_upsert(c, f"disk:{dev}:pending_absolute", source="deep",
+                                               itype="smart", sev_level=2, value=v,
+                                               reason=f"pending sectors aanwezig ({v})", )
+                    if etype in ("new", "escalated"):
+                        events.append(emit("deep", "disk_health", f"disk:{dev}:pending_absolute",
+                                           current=v, previous=prev, severity="warning",
+                                           provisional=True, state="active", baseline_pending=True,
+                                           reason="pending > 0 (absolute regel, §12)", source="deep"))
+                if delta > 0:
+                    jump = int(cfg.get("counters", {}).get("crc_jump_warning", 50))
+                    lvl = 2 if (delta >= jump or short != "crc") else 1
+                    _, etype = incident_upsert(c, f"disk:{dev}:{short}_growth", source="deep",
+                                               itype="smart_counter", sev_level=lvl, value=delta,
+                                               reason=f"{short} {int(prev)} -> {int(v)} (+{int(delta)})",
+                                               )
+                    if etype in ("new", "escalated") or lvl >= 2:
+                        events.append(emit("deep", "disk_health", f"disk:{dev}:{short}_growth",
+                                           current=int(v), previous=int(prev), severity=NAME[lvl],
+                                           provisional=True, state="active", baseline_pending=True,
+                                           reason=f"monotone teller +{int(delta)} (delta-regel, §12)",
+                                           source="deep"))
+                elif delta == 0 and short == "crc":
+                    pass  # identiek: geen event (§12)
+        st["disks"] = len(dh["data"])
+    else:
+        events.append(emit("deep", "disk_health", "ssh:disk_health", severity="notice",
+                           provisional=True, state="observed", baseline_pending=True,
+                           reason=f"deep check mislukt: {dh.get('error')}", source="deep"))
+
+    # array-status: alleen pos/size/pct bepaalt actieve operatie (§13)
+    ar = ssh_action("array-status")
+    if ar.get("ok"):
+        data = ar["data"]
+        if data.get("state") != "STARTED":
+            _, etype = incident_upsert(c, "host:array:stopped", source="deep", itype="array",
+                                       sev_level=4, value=0, reason=f"state={data.get('state')}",
+                                       )
+            if etype in ("new", "escalated"):
+                events.append(emit("deep", "array_status", "host:array:stopped", current=data.get("state"),
+                                   severity="critical", provisional=True, state="active",
+                                   baseline_pending=True, reason="array niet STARTED", source="deep"))
+        if data.get("resync_pct") not in (None, 0, 100):
+            _, etype = incident_upsert(c, "host:array:resync", source="deep", itype="array",
+                                       sev_level=1, value=data.get("resync_pct"),
+                                       reason=f"resync {data.get('resync_action')} @ {data.get('resync_pct')}%",
+                                       )
+            if etype in ("new", "escalated"):
+                events.append(emit("deep", "array_status", "host:array:resync", current=data.get("resync_pct"),
+                                   severity="notice", provisional=True, state="active",
+                                   baseline_pending=True,
+                                   reason="parity/resync werkelijk actief (pos/size, §13)", source="deep"))
+        st["array"] = data.get("state")
+
+    # pool read-only → CRITICAL (§10)
+    ps = ssh_action("pool-status")
+    if ps.get("ok"):
+        for p in ps["data"]:
+            if not p.get("rw", True):
+                _, etype = incident_upsert(c, f"pool:{p['mount']}:readonly", source="deep", itype="pool",
+                                           sev_level=4, value=0, reason="read-only remount", )
+                if etype in ("new", "escalated"):
+                    events.append(emit("deep", "pool_status", f"pool:{p['mount']}:readonly", current=p,
+                                       severity="critical", provisional=True, state="active",
+                                       baseline_pending=True, reason="pool read-only gemount", source="deep"))
+
+    # docker containers: restart-delta + exit-classificatie (§14)
+    known = set(cfg.get("docker_daemon", {}).get("known_stopped", []))
+    loop_delta = int(cfg.get("docker_daemon", {}).get("restart_loop_delta", 3))
+    ds = ssh_action("docker-status")
+    if ds.get("ok"):
+        for cont in ds["data"]["containers"]:
+            name = cont["name"]
+            restarts = int(cont.get("restarts") or 0)
+            state = cont["state"]
+            prev, delta = counter(c, f"restarts:{name}", name, restarts)
+            lvl = 2 if delta >= loop_delta else (1 if delta > 0 else 0)
+            if lvl:
+                _, etype = incident_upsert(c, f"docker:{name}:restarts", source="deep",
+                                           itype="docker_restarts", sev_level=lvl, value=delta,
+                                           reason=f"restarts {int(prev)} -> {restarts} (+{int(delta)})",
+                                           )
+                if etype in ("new", "escalated"):
+                    events.append(emit("deep", "docker_restarts", f"docker:{name}:restarts",
+                                       current=restarts, previous=int(prev), severity=NAME[lvl],
+                                       provisional=True, state="active", baseline_pending=True,
+                                       reason=f"restart-delta +{int(delta)} (loop-kandidaat bij >= {loop_delta})",
+                                       source="deep"))
+            if state != "running":
+                events.append(emit("deep", "docker_exited", f"docker:{name}:exited", current=state,
+                                   severity="notice", provisional=True, state="classified",
+                                   baseline_pending=True,
+                                   reason=("bekend bewust gestopt (suppressed in later stadium)"
+                                           if name in known else
+                                           "exited container (niet in known_stopped)"), source="deep"))
+        st["containers"] = ds["data"].get("count")
+
+    # vdisk deep-vs-sampler bevestiging
+    dv = ssh_action("docker-vdisk-status")
+    if dv.get("ok"):
+        pts = fetch_series("vdisk_pct", 1)
+        if pts and dv["data"].get("pct") is not None:
+            diff = abs(dv["data"]["pct"] - pts[-1][1])
+            if diff > 2:
+                events.append(emit("deep", "vdisk_confirm", "host:docker_vdisk:mismatch",
+                                   current=dv["data"]["pct"], previous=pts[-1][1], severity="notice",
+                                   provisional=True, state="observed", baseline_pending=True,
+                                   reason=f"deep vs sampler verschil {diff:.1f}pp", source="deep"))
+        st["vdisk_pct"] = dv["data"].get("pct")
+
+    # kernel/fs errors: fingerprint-dedup (§17); ro-remount = CRITICAL
+    for action, source, since in (("kernel-errors", "kernel_errors", "6h"),
+                                  ("fs-errors", "fs_errors", "24h")):
+        r = ssh_action(action, since)
+        if r.get("ok"):
+            for line in r["data"].get("lines", []):
+                fp = f"host:{source}:{line_fingerprint(line)}"
+                crit = bool(re.search(r"remount.{0,20}read-only|read-only.{0,20}remount", line, re.I))
+                lvl = 4 if crit else 2
+                _, etype = incident_upsert(c, fp, source=source, itype=source, sev_level=lvl,
+                                           value=0, reason=line[:200], )
+                if etype in ("new", "escalated"):
+                    events.append(emit("deep", source, fp, current=line[:240], severity=NAME[lvl],
+                                       provisional=True, state="active", baseline_pending=True,
+                                       reason="nieuw error-fingerprint", source="deep"))
+            c.execute("insert into cursors(name, value, last_checked) values(?,?,?)"
+                      " on conflict(name) do update set value=excluded.value,"
+                      " last_checked=excluded.last_checked", (source, since, now_iso()))
+
+    # memory-status crosscheck OOM-teller (§11: lege dmesg is géén bewijs)
+    ms = ssh_action("memory-status")
+    if ms.get("ok"):
+        st["oom_kills_deep"] = ms["data"].get("oom_kills_total")
+
+    # docker-space-detail alleen bij actief groei-incident (§8)
+    growth = c.execute("select state from incidents where fingerprint='host:docker_vdisk:growth'").fetchone()
+    if growth and growth[0] == "active":
+        sp = ssh_action("docker-space-detail", timeout=60)
+        events.append(emit("deep", "docker_space_detail", "host:docker_vdisk:growth",
+                           current=sp if sp.get("ok") else sp.get("error"), severity="notice",
+                           provisional=True, state="diagnostic", baseline_pending=True,
+                           reason="aanbevolen diagnose bij actief groei-incident", source="deep"))
+
+    active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
+    c.commit(); c.close()
+    return {"mode": "deep", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
+            "incidents_active": active, "dry_run": DRY_RUN,
+            **{f"info_{k}": v for k, v in st.items()}}
+
+# ---------------------------------------------------------------- baseline --
+def run_baseline(cfg, events):
+    metrics = ["mem_used_pct", "vdisk_pct", "logfs_pct", "cache_pct", "vm_pct", "user_pct",
+               "rootfs_pct", "package_temp_c", "core_max_temp_c", "load1"]
+    out = {}
+    for m in metrics:
+        pts = fetch_series(m, 48)
+        if len(pts) < 4:
+            continue
+        vals = sorted(v for _, v in pts)
+        q = lambda p: vals[min(len(vals) - 1, round(p * (len(vals) - 1)))]
+        slopes = []
+        for i in range(max(1, len(pts) - 12)):
+            t = trend_of(pts[i:i + 13])
+            if t.get("slope_per_h") is not None:
+                slopes.append(t["slope_per_h"])
+        sect = (cfg.get("memory", {}) if m == "mem_used_pct" else
+                cfg.get("docker_vdisk", {}) if m == "vdisk_pct" else
+                cfg.get("logfs", {}) if m == "logfs_pct" else
+                cfg.get("temperatures", {}) if "temp" in m else
+                cfg.get("storage", {}) if m.endswith("_pct") else {})
+        cur = sect.get("warn_pct") if sect else None
+        sugg = round(min(99.0, q(0.99) + 5), 1) if "temp" not in m else round(q(0.99) + 3, 1)
+        out[m] = {"n": len(vals), "min": round(min(vals), 2), "p50": round(q(0.5), 2),
+                  "p95": round(q(0.95), 2), "p99": round(q(0.99), 2), "max": round(max(vals), 2),
+                  "typical_slope_per_h": round(statistics.median(slopes), 3) if slopes else None,
+                  "current_warn": cur, "suggested_warn": sugg}
+    (HL / "baseline-report.json").write_text(json.dumps(out, indent=1))
+    print(json.dumps(out, indent=1))
+    return {"mode": "baseline-report", "run_id": RUN_ID, "ts": now_iso(),
+            "metrics": len(out), "dry_run": DRY_RUN}
+
+# -------------------------------------------------------------------- test --
+SAMPLES_SCHEMA = """create table samples(
+  ts integer primary key, sampler_ver integer,
+  mem_total_kb integer, mem_used_kb integer, mem_avail_kb integer, mem_used_pct real,
+  psi_mem_some real, psi_mem_full real, psi_cpu_some real, psi_io_some real,
+  swap_total_kb integer, swap_used_kb integer, oom_kills integer,
+  load1 real, load5 real, load15 real,
+  package_temp_c integer, core_max_temp_c integer,
+  ssd_sda_temp_c integer, ssd_sdd_temp_c integer,
+  docker_ok integer, containers_running integer, containers_exited integer,
+  containers_unhealthy integer, containers_restarting integer,
+  vdisk_mounted integer, vdisk_total_kb integer, vdisk_used_kb integer,
+  vdisk_avail_kb integer, vdisk_pct real, vdisk_alloc_mb integer,
+  logfs_total_kb integer, logfs_used_kb integer, logfs_pct real,
+  rootfs_pct real, cache_used_kb integer, cache_total_kb integer, cache_pct real,
+  vm_pct real, user_pct real);"""
+
+def run_test(cfg):
+    """Synthetische cases; zelfde codepad als productie (replay + state-db)."""
+    results = []
+    def check(name, cond, detail=""):
+        results.append((name, bool(cond), detail))
+
+    def fresh(series, minutes=5, seed_counters=None):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        con = sqlite3.connect(tmp / "homelab" / "samples.db")
+        con.executescript(SAMPLES_SCHEMA)
+        n = max(len(v) for v in series.values())
+        now = int(datetime.now(timezone.utc).timestamp())
+        cols = ["ts"] + list(series.keys())
+        for i in range(n):
+            vals = [now - (n - 1 - i) * minutes * 60]
+            for seq in series.values():
+                vals.append(seq[i] if i < len(seq) else seq[-1])
+            con.execute(f"insert into samples({','.join(cols)})"
+                        f" values({','.join('?' for _ in cols)})", vals)
+        con.commit(); con.close()
+        if seed_counters:
+            scon = sqlite3.connect(tmp / "homelab" / "agent_state.db")
+            scon.execute("create table counters(name text primary key, device text,"
+                         " previous_value real, current_value real, delta real, last_checked text)")
+            scon.executemany("insert into counters values(?,?,?,?,?,?)",
+                             [(n_, d_, p_, c_, 0, "seed") for n_, d_, p_, c_ in seed_counters])
+            scon.commit(); scon.close()
+        return tmp
+
+    def eval_in(tmp, mode="fast"):
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        try:
+            evs = []
+            con = state_db()
+            (run_fast if mode == "fast" else run_deep)(cfg, evs)
+            con.close()
+            inc = {}
+            c2 = sqlite3.connect(STATE_DB)
+            for fp, state, sev in c2.execute("select fingerprint, state, current_severity from incidents"):
+                inc[fp] = (state, sev)
+            c2.close()
+            return inc, evs
+        finally:
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # RAM
+    inc, _ = eval_in(fresh({"mem_used_pct": [60, 70, 80, 90]}))
+    check("RAM 60->70->80->90 stijgend -> warning (provisional)",
+          inc.get("host:memory:high") == ("active", "warning"), str(inc.get("host:memory:high")))
+    inc, _ = eval_in(fresh({"mem_used_pct": [95, 95, 90, 84, 80, 80]}))
+    check("RAM 95->84 dalend -> recovering/resolved",
+          inc.get("host:memory:high", ("missing", "?"))[0] in ("resolved", "recovering"),
+          str(inc.get("host:memory:high")))
+    inc, _ = eval_in(fresh({"mem_used_pct": [90, 90, 90]}))
+    check("RAM 90 stabiel x3 -> warning",
+          inc.get("host:memory:high", ("", ""))[1] == "warning", str(inc.get("host:memory:high")))
+    inc, evs = eval_in(fresh({"mem_used_pct": [40] * 3, "oom_kills": [2, 2, 2]}))
+    check("OOM baseline (eerste waarneming) -> geen incident",
+          "host:memory:oom" not in inc, str(inc.get("host:memory:oom")))
+    inc, evs = eval_in(fresh({"mem_used_pct": [40] * 4, "oom_kills": [2, 2, 2, 3]},
+                             seed_counters=[("oom_kills", "host", 2, 2)]))
+    check("OOM +1 -> critical incident",
+          inc.get("host:memory:oom", ("", ""))[1] == "critical", str(inc.get("host:memory:oom")))
+    # Docker vDisk
+    inc, _ = eval_in(fresh({"vdisk_pct": [70] * 8, "vdisk_used_kb": [107374182] * 8}))
+    check("vdisk stabiel 70 -> geen incident",
+          "host:docker_vdisk:high" not in inc and "host:docker_vdisk:growth" not in inc, str(list(inc)))
+    kb0, kb1 = 0.70 * 157286400, 0.80 * 157286400
+    inc, _ = eval_in(fresh({"vdisk_pct": [70] * 12 + [80], "vdisk_used_kb": [kb0] * 12 + [kb1]}))
+    check("vdisk 70->80 in 1u -> growth warning",
+          inc.get("host:docker_vdisk:growth", ("", ""))[1] == "warning", str(inc.get("host:docker_vdisk:growth")))
+    inc, _ = eval_in(fresh({"vdisk_pct": [95, 95, 90, 84, 80]}))
+    check("vdisk 95->80 dalend -> recovering/resolved",
+          inc.get("host:docker_vdisk:high", ("missing", "?"))[0] in ("resolved", "recovering"),
+          str(inc.get("host:docker_vdisk:high")))
+    # Temperatuur (§7)
+    inc, _ = eval_in(fresh({"package_temp_c": [75, 75, 93]}))
+    check("temp één sample 93 -> notice (cap)",
+          inc.get("host:temperature:package", ("", ""))[1] == "notice", str(inc.get("host:temperature:package")))
+    inc, _ = eval_in(fresh({"package_temp_c": [93, 93, 93]}))
+    check("temp sustained 93 -> warning",
+          inc.get("host:temperature:package", ("", ""))[1] == "warning", str(inc.get("host:temperature:package")))
+    inc, _ = eval_in(fresh({"package_temp_c": [93, 93, 88, 84, 82]}))
+    check("temp 93->82 dalend -> recovering/resolved",
+          inc.get("host:temperature:package", ("missing", "?"))[0] in ("resolved", "recovering"),
+          str(inc.get("host:temperature:package")))
+    inc, _ = eval_in(fresh({"package_temp_c": [80, 85, 90, 94]}))
+    check("temp 80->85->90->94 stijgend -> urgent",
+          inc.get("host:temperature:package", ("", ""))[1] == "urgent", str(inc.get("host:temperature:package")))
+    # /var/log
+    inc, _ = eval_in(fresh({"logfs_pct": [60] * 12 + [68]}))
+    check("logfs snelle groei -> warning growth",
+          inc.get("host:logfs:growth", ("", ""))[1] == "warning", str(inc.get("host:logfs:growth")))
+    inc, _ = eval_in(fresh({"logfs_pct": [80, 80, 74, 60, 55]}))
+    check("logfs hoog-dalend -> recovering/resolved",
+          inc.get("host:logfs:high", ("missing", "?"))[0] in ("resolved", "recovering", "missing"),
+          str(inc.get("host:logfs:high")))
+    # SMART counters (§12) via fake SSH in deep-mode
+    def dh(crc, real, pend, unc):
+        return {"ok": True, "data": [{"device": "/dev/sda", "state": "active", "health": "PASSED",
+                                      "crc_errors": crc, "reallocated": real, "pending": pend,
+                                      "offline_uncorrectable": unc, "media_errors": None, "wear_pct": 81}]}
+    steps = [dh(458813, 0, 0, 0), dh(458813, 0, 0, 0), dh(458814, 0, 1, 0)]
+    def fake_ssh_factory(seq, disk_health="__seq__", docker_status="__seq__"):
+        i = {"n": 0}
+        def fake(action, *a, **k):
+            if action == "disk-health":
+                if disk_health != "__seq__":
+                    return disk_health
+                r = seq[min(i["n"], len(seq) - 1)]; return r
+            if action == "docker-status":
+                if docker_status != "__seq__":
+                    return docker_status[min(i["n"], len(docker_status) - 1)]
+                return {"ok": True, "data": {"count": 0, "containers": []}}
+            if action == "docker-restarts": return {"ok": True, "data": {"containers": []}}
+            if action == "array-status": return {"ok": True, "data": {"state": "STARTED",
+                "parity_synced": 0, "resync_action": "check", "resync_pct": 0}}
+            if action == "pool-status": return {"ok": True, "data": [{"mount": "/mnt/cache", "rw": True}]}
+            if action == "docker-vdisk-status": return {"ok": True, "data": {"pct": None}}
+            if action in ("kernel-errors", "fs-errors"): return {"ok": True, "data": {"lines": []}}
+            if action == "memory-status": return {"ok": True, "data": {"oom_kills_total": 0}}
+            return {"ok": False, "error": "onverwacht"}
+        return fake, i
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db", STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    fake, i = fake_ssh_factory(steps)
+    real_ssh = ssh_action
+    globals()["ssh_action"] = fake
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # baseline
+        i["n"] = 1
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # 458813 -> 458813
+        check("SMART crc 458813->458813 -> geen event",
+              not any("crc_growth" in e["fingerprint"] for e in evs), str(len(evs)))
+        i["n"] = 2
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # +1 crc, pending 0->1
+        crc_ev = [e for e in evs if e["fingerprint"] == "disk:/dev/sda:crc_growth"]
+        pend_ev = [e for e in evs if e["fingerprint"] == "disk:/dev/sda:pending_absolute"]
+        check("SMART crc 458813->458814 -> notice event",
+              len(crc_ev) == 1 and crc_ev[0]["severity"] == "notice", str(crc_ev)[:140])
+        check("SMART pending 0->1 -> warning (absolute)",
+              len(pend_ev) == 1 and pend_ev[0]["severity"] == "warning", str(pend_ev)[:140])
+    finally:
+        globals()["ssh_action"] = real_ssh
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Docker restarts (§14)
+    seq = [{"ok": True, "data": {"count": 1, "containers": [
+                {"name": "plex", "state": "running", "health": "healthy", "restarts": 12,
+                 "started": "2026-01-01T00:00:00", "exit_code": 0, "mem_limit_bytes": 0}]}},
+           {"ok": True, "data": {"count": 1, "containers": [
+                {"name": "plex", "state": "running", "health": "healthy", "restarts": 12,
+                 "started": "2026-01-01T00:00:00", "exit_code": 0, "mem_limit_bytes": 0}]}},
+           {"ok": True, "data": {"count": 1, "containers": [
+                {"name": "plex", "state": "running", "health": "healthy", "restarts": 15,
+                 "started": "2026-01-01T00:00:00", "exit_code": 0, "mem_limit_bytes": 0}]}}]
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db", STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    fake, i = fake_ssh_factory(seq, disk_health={"ok": True, "data": []},
+                               docker_status=seq)
+    globals()["ssh_action"] = fake
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # baseline 12
+        i["n"] = 1
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # 12 -> 12
+        check("restarts 12->12 -> geen event",
+              not any("docker:plex:restarts" in e["fingerprint"] for e in evs), str(len(evs)))
+        i["n"] = 2
+        evs = []; con = state_db(); run_deep(cfg, evs); con.close()   # 12 -> 15
+        r = [e for e in evs if e["fingerprint"] == "docker:plex:restarts"]
+        check("restarts 12->15 (+3) -> warning loop-kandidaat",
+              len(r) == 1 and r[0]["severity"] == "warning", str(r)[:140])
+    finally:
+        globals()["ssh_action"] = real_ssh
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Recovery (§16): WARNING -> goede sample(s) -> RECOVERING -> RESOLVED
+    inc, _ = eval_in(fresh({"mem_used_pct": [91, 91, 80, 80, 80]}))
+    st, sev = inc.get("host:memory:high", ("missing", "?"))
+    check("recovery WARNING -> RECOVERING/RESOLVED", st in ("recovering", "resolved"), f"{st}/{sev}")
+
+    fails = [r for r in results if not r[1]]
+    for name, okk, detail in results:
+        print(f"{'PASS' if okk else 'FAIL'}  {name}" + (f"  [{detail}]" if detail and not okk else ""))
+    print(f"\n{len(results) - len(fails)}/{len(results)} geslaagd")
+    return 0 if not fails else 1
+
+# --------------------------------------------------------------------- main --
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "fast"
+    cfg = load_cfg()
+    if mode == "test":
+        sys.exit(run_test(cfg))
+    HL.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock = open(HL / "evaluator.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("evaluator: vorige run nog actief; overgeslagen")
+        return
+    events = []
+    if mode == "fast":
+        summary = run_fast(cfg, events)
+    elif mode == "deep":
+        summary = run_deep(cfg, events)
+    elif mode == "baseline-report":
+        summary = run_baseline(cfg, events)
+    else:
+        print(f"onbekende mode: {mode}"); sys.exit(64)
+    print(json.dumps(summary, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()

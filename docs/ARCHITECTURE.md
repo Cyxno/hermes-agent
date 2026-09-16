@@ -78,3 +78,27 @@ Semantiek-opmerkingen: `wear_pct` is bij NVMe "Percentage Used" (slijtage) en bi
 ATA attr 231 "SSD_Life_Left" (restleven) — evaluator interpreteert per bron.
 `parity_synced` in array-status is een epoch-tijdstip van de laatste sync.
 PSI bestaat niet op deze host (kernel zonder PSI) en wordt nergens verwacht.
+
+## Fase 3 — deterministische evaluator (dry-run)
+
+`scripts/hermes_evaluator.py` (container-side, uid 10000, one-shot via host-cron):
+- **fast** (7,22,37,52 * * * *): replayt nieuwe samples uit `samples.db` (cursor
+  `fast:last_ts`), berekent trends (d15m/d1h/d6h, OLS-slope, min/max, sustain),
+  past banden + hysteresis (enter/exit −5pp, 2 samples) + recovery
+  (RECOVERING → RESOLVED na 2 goede samples) toe. Geen SSH.
+- **deep** (23 * * * *): read-only SSH — disk-health (standby-aware),
+  array-status (actieve resync alleen op pos/size), pool ro/ro, docker-status
+  (restart-delta ≥3 = loop-kandidaat; exits alleen classificatie),
+  kernel/fs-errors (fingerprint-dedup), vdisk-confirm; docker-space-detail
+  alléén bij actief groei-incident; oom-events alleen bij OOM-teller-delta.
+- **baseline-report**: min/p50/p95/p99/max + typische slope + suggested warn.
+- **test**: 20 synthetische cases via zelfde codepad.
+
+State: `homelab/agent_state.db` (WAL, busy_timeout 5000) met incidents,
+metric_state, counters (monotone SMART/OOM-tellers: alleen delta = event,
+eerste waarneming = baseline) en cursors. Events: `homelab/evaluator-events.jsonl`
+(audit: waarom WARNING, zonder LLM). Alles `baseline_pending: true` → elke
+severity is provisional tot de baseline is goedgekeurd.
+
+Modelrouting/prometheus zijn bewust afwezig: later als optionele provider
+in te haken zonder deze code aan te passen.

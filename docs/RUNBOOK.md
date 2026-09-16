@@ -48,3 +48,18 @@ uit dan blijft de host-sampler gewoon draaien.
 - Verdenking op lock: `sqlite3 samples.db 'pragma integrity_check;'` — WAL herstelt
   zelf na crash; nooit handmatig `-wal`/`-shm` wissen terwijl processen leven.
 - Rollback deployment: vorige git-revisie uitchecken + `deploy/install.sh`.
+
+## Evaluator (fase 3, dry-run)
+
+```bash
+# handmatig (one-shot container, uid 10000; geen gateway/telegram)
+docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
+  -v /mnt/user/appdata/hermes/data:/opt/data -e HERMES_HOME=/opt/data \
+  nousresearch/hermes-agent:latest /opt/data/scripts/hermes_evaluator.py fast   # of deep / test
+```
+
+- Synthetische tests: `… hermes_evaluator.py test` (20 cases, verwacht 20/20).
+- Baseline: `… hermes_evaluator.py baseline-report` → `homelab/baseline-report.json`.
+- Audit: `jq -r '[.ts,.fingerprint,.severity,.state,.reason]|@tsv' homelab/evaluator-events.jsonl`.
+- State: `homelab/agent_state.db` — incidents/metric_state/counters/cursors.
+- Cron: user.scripts "Hermes evaluator fast" (7,22,37,52) + "deep" (23 * * * *).

@@ -31,6 +31,7 @@ memory:
   critical_pct: 97
   critical_when_oom: true
   rise_rate_pct_per_hour: 5
+  oom_event_severity: critical
   note: "available-mem weegt mee; PSI bepaalt onderscheid warning vs urgent"
 
 psi:
@@ -61,6 +62,8 @@ logfs:
   warn_pct: 70
   urgent_pct: 85
   critical_pct: 95
+  growth_warn_pp_per_hour: 5
+  note: "klein tmpfs (128M): snelle groei weegt zwaarder dan absolute hoogte"
 
 storage:
   baseline_pending: true
@@ -76,14 +79,28 @@ temperatures:
   package_critical_c: 100
   ssd_warn_c: 60
   ssd_urgent_c: 70
-  sustained_minutes_warn: 60
+  sustained_minutes: 15
+  rise_urgent_ppc_per_hour: 5
+  note: "één hoge sample = max provisional NOTICE; pas bij sustains/rise een band omhoog"
+
+recovery:
+  baseline_pending: true
+  good_samples_to_resolve: 2
+  note: "WARNING → RECOVERING (eerste goede sample) → RESOLVED (na N goede samples)"
 
 docker_daemon:
   baseline_pending: true
   unreachable_severity: critical
   unexpected_exit_warn: true
-  restart_loop_min_restarts: 3
+  restart_loop_delta: 3
   restart_loop_window_minutes: 15
+  known_stopped: [hermes]
+  note: "hermes is bewust gestopt; bekende containers alleen NOTICE-classificatie"
+
+counters:
+  baseline_pending: true
+  crc_jump_warning: 50
+  note: "monotone counters: alleen delta is een event; eerste waarneming = baseline"
 
 array_disks:
   baseline_pending: true

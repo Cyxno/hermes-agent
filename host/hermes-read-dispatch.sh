@@ -179,7 +179,7 @@ f2_disk_health() {
     devs="sda sdb sdc sdd sde sdf sdg"
   fi
   for dv in $devs; do
-    d="$dv"
+    d="$dv"; [[ $d == /dev/* ]] || d="/dev/$d"
     outi=$(timeout 8 smartctl -n standby -i "$d" 2>/dev/null) || true
     if grep -qi 'device is in standby' <<<"${outi:-}"; then
       out+="$sep$(printf '{"device":"%s","state":"standby","note":"niet gewekt"}' "$d")"; sep=","; continue
@@ -195,9 +195,10 @@ f2_disk_health() {
     wear=$(grep -m1 'Percentage Used' <<<"${h:-}" | sed 's/.*:[[:space:]]*//' | tr -d '%') || true
     [[ -z ${wear:-} ]] && wear=$(awk '$1==177 || $1==231{print $10; exit}' <<<"${h:-}" | awk '{print $1}')
     med=$(grep -m1 'Media and Data Integrity Errors' <<<"${h:-}" | sed 's/.*:[[:space:]]*//' | tr -d '%') || true
-    out+="$sep$(printf '{"device":"%s","state":"active","model":"%s","health":"%s","temp_c":%s,"reallocated":%s,"pending":%s,"offline_uncorrectable":%s,"media_errors":%s,"wear_pct":%s}' \
+    crc=$(awk '$1==199{print $10; exit}' <<<"${h:-}" | awk '{print $1}') || true
+    out+="$sep$(printf '{"device":"%s","state":"active","model":"%s","health":"%s","temp_c":%s,"reallocated":%s,"pending":%s,"offline_uncorrectable":%s,"media_errors":%s,"crc_errors":%s,"wear_pct":%s}' \
       "$d" "$(san "$model")" "$(san "$health")" "$(jnum "$temp")" "$(jnum "$rel")" \
-      "$(jnum "$pend")" "$(jnum "$uc")" "$(jnum "$med")" "$(jnum "$wear")")"
+      "$(jnum "$pend")" "$(jnum "$uc")" "$(jnum "$med")" "$(jnum "$crc")" "$(jnum "$wear")")"
     sep=","
   done
   ok disk-health "${out}]"
