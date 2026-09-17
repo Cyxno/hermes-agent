@@ -452,20 +452,22 @@ def run_notifications(cfg=None, *, home=None, state_db_path=None, samples_db_pat
         nrow = None
         r = c.execute("select last_notified_at, last_notified_severity, last_notified_state,"
                       " notification_count, ever_notified, resolved_notified, pending,"
-                      " retry_count, next_retry_at from notifications where fingerprint=?",
-                      (fp,)).fetchone()
+                      " retry_count, next_retry_at, pending_json from notifications"
+                      " where fingerprint=?", (fp,)).fetchone()
         if r:
             nrow = {"last_notified_at": r[0], "last_notified_severity": r[1],
                     "last_notified_state": r[2], "notification_count": r[3] or 0,
                     "ever_notified": r[4] or 0, "resolved_notified": r[5] or 0,
-                    "pending": r[6] or 0, "retry_count": r[7] or 0, "next_retry_at": r[8]}
+                    "pending": r[6] or 0, "retry_count": r[7] or 0, "next_retry_at": r[8],
+                    "pending_json": r[9]}
         # 1) pending retry eerst (fail-safe: niet-afgeleverde meldingen blijven staan)
         if nrow and nrow["pending"] and nrow["next_retry_at"]:
             due = parse_ts(nrow["next_retry_at"])
             if due and due <= now:
                 stats["candidates"] += 1
                 stats["retried"] += 1
-                text = nrow.get("pending_json") or ""
+                text = nrow.get("pending_json") or build_text(
+                    fp, inc, None, {}, "retry")  # lege pending -> herbouw (deterministisch)
                 ok = deliver(c, fp=fp, inc=inc, nrow=nrow, event="retry", text=text,
                              cfgn=cfgn, audit_path=audit_path, token=token, chat=chat,
                              sender=sender, events=events)

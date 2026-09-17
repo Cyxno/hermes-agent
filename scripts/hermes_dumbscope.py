@@ -65,6 +65,12 @@ class DumbScopeClient:
             headers["Origin"] = self.base
         req = urllib.request.Request(self.base + path, method=method, headers=headers)
         if cookie:
+            # _login geeft de kale token-waarde terug; maak er een volledige
+            # cookie-header van (anders 401 op iedere GET na login).
+            # Let op: cookienaam is dumbscope_session (underscore), het
+            # sessie-BESTAND heet dumbscope-session (streepje).
+            if "=" not in cookie:
+                cookie = f"dumbscope_session={cookie}"
             req.add_header("Cookie", cookie)
         data = None
         if body is not None:

@@ -536,6 +536,8 @@ def needs_llm_analysis(c, fp, severity, state):
         return False, "skip:severity_onder_warning"
     if fp == "dumbscope:availability":
         return False, "skip:bekende_oorzaak(availability/auth)"
+    if fp == "prometheus:availability" or fp.startswith("notifications:"):
+        return False, "skip:bekende_oorzaak(infra_delivery)"
     if fp.startswith("dumbscope:"):
         d = c.execute("select root_cause_service, evidence_json, host_correlations"
                       " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
