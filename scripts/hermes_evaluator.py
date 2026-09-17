@@ -845,7 +845,7 @@ def run_fast(cfg, events):
     try:
         import hermes_prometheus as hprom
         if (cfg.get("prometheus") or {}).get("enabled", True):
-            prom = hprom.run_prometheus_context(cfg, c, events, home=HL, emit=emit, mode="fast")
+            prom = hprom.run_prometheus_context(cfg, c, events, home=HOME, emit=emit, mode="fast")
             st["prometheus"] = {k: v for k, v in prom.items() if k != "history"}
             st["prom_metrics"] = sorted(prom.get("history", {}))
     except Exception as e:  # noqa: BLE001 — isolatie bewust breed (§21-analoog)
@@ -1689,7 +1689,7 @@ def main():
             try:
                 import hermes_notifier
                 summary["notifications"] = hermes_notifier.run_notifications(
-                    cfg, home=HL, state_db_path=STATE_DB, samples_db_path=SAMPLES_DB)
+                    cfg, home=HOME, state_db_path=STATE_DB, samples_db_path=SAMPLES_DB)
             except Exception as e:  # noqa: BLE001 — isolatie bewust breed
                 events.append(emit("fast", "notification_integration",
                                    "notifications:integration_error", severity="notice",
