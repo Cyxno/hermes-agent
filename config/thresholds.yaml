@@ -100,9 +100,9 @@ dumbscope:
 
 llm:
   baseline_pending: true
-  # fase 5 NOG NIET actief: LLM-router bewust uitgeschakeld (0 tokens).
-  # Pas na expliciete goedkeuring op true zetten.
-  enabled: false
+  # fase 5 ACTIEF (sinds Stap C van de vervolgfase): limits hieronder gelden.
+  # Telegram-alerting (fase 4.5) blijft onafhankelijk van deze laag.
+  enabled: true
   confidence_stop: 0.85
   max_calls_per_incident: 3
   max_calls_per_day: 8

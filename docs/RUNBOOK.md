@@ -79,7 +79,7 @@ docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
 - Delivery-failure: pending + retry met backoff (60s→max 15min); ≥3 mislukkingen
   achter elkaar = lokaal incident `notifications:delivery`, geen Telegram-recursie.
 
-## LLM-router (fase 5) — NOG NIET ACTIEF (llm.enabled: false)
+## LLM-router (fase 5) — ACTIEF (llm.enabled: true, Stap C)
 
 ```bash
 # live micro-smoketest per tier (gebruikt .env key):
