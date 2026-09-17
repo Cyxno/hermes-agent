@@ -1602,6 +1602,8 @@ def run_test(cfg):
         globals()["run_llm_layer_orig"] = None
         # monkeypatch hr.analyze
         hr_analyze_real = hr.analyze
+        hr_lev_real = hr.load_env_key
+        hr.load_env_key = lambda env_path=None: "test"  # fixture: .env bestaat niet in tempdir-HOME
         hr.analyze = fake_analyze
         llm_on = dict(cfg.get("llm") or {}, enabled=True)
         llm_on = {"llm": dict(cfg.get("llm") or {}, enabled=True)}
@@ -1628,6 +1630,7 @@ def run_test(cfg):
     finally:
         globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
         hr.analyze = hr_analyze_real
+        hr.load_env_key = hr_lev_real
         _sh.rmtree(tmp, ignore_errors=True)
 
 
