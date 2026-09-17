@@ -26,7 +26,7 @@ for f in "${FILES[@]}"; do
   [[ -f $f ]] || continue
   [[ $f == tools/check-secrets.sh ]] && continue  # de scanner bevat zijn eigen patronen
   for p in "${PATTERNS[@]}"; do
-    if grep -nIE "$p" -- "$f" 2>/dev/null | grep -vE '\.env\.example|<[^>]*>|your[-_]?key|PLACEHOLDER| Voorbeeld|voorbeeld|read_text|environ|getenv|_FILE'; then
+    if grep -nIE "$p" -- "$f" 2>/dev/null | grep -vE '\.env\.example|<[^>]*>|your[-_]?key|PLACEHOLDER| Voorbeeld|voorbeeld|read_text|environ|getenv|_FILE|REDACTED|sk-abcdefghij|startswith\("OPENROUTER_API_KEY'; then
       echo "VERDACHT PATROON '$p' in: $f" >&2
       rc=1
     fi

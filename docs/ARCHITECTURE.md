@@ -133,3 +133,28 @@ root-cause opnieuw.
 - **Host-correlatie (§13):** actieve host-incidenten (≥warning) worden als
   `host_correlations` aan DUMBscope-events toegevoegd — gelijktijdigheid, geen
   oorzaak-claim.
+
+## Fase 5 — LLM-router (expliciet, auditbaar)
+
+`scripts/hermes_router.py`: één model per request, `allow_fallbacks=false`,
+`requested_model == actual_model` wordt gecontroleerd (mismatch = routing_violation,
+response onvertrouwd). Ling (tier 1) zonder `response_format` en met
+`reasoning: {enabled: false}` (live gemeten: 0 reasoning-tokens); DeepSeek (tier 2)
+idem reasoning uit + JSON-modus; GLM (tier 3) uitsluitend bij DeepSeek-providerfout
+( `reasoning effort: low`); Luna (tier 4) alleen bij urgent/critical + multi-system +
+DeepSeek-conf < 0,5.
+
+- **Tier 0 skip-regels** (`needs_llm_analysis`): bekende deterministische oorzaken
+  (threshold/growth/restart-delta/CRC-delta/availability) worden nooit naar een model
+  gestuurd; DUMBscope-incidenten met duidelijke rootCauseService + evidence evenmin.
+- **Escalatie** (deterministic code): conf < 0,85 / onbekende oorzaak / multi-system /
+  invalid JSON / providerfout / routing-violatie — elke reden in de audit.
+- **Limits**: 3 calls per incident-lifecycle, 8 per kalenderdag (config), audit
+  `llm_budget_exhausted:*`.
+- **Audit**: `homelab/router_calls.jsonl` — requested/actual/provider/tokens
+  (incl. reasoning)/latency/cost/confidence/routing_violation/error.
+- **State**: llm_*-kolommen op incidents + `llm_context_hash` — ongewijzigde
+  incidenten worden niet her-analyseerd.
+- **Sanitizer** redigeert secretpatronen vóór iedere call (getest).
+- In testmodus (`hermes_evaluator.py test`) staat de llm-laag uit: tests maken
+  nooit echte modelcalls; de routertests mocken het transport.

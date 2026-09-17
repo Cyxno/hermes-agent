@@ -101,6 +101,23 @@ def state_db():
       resolved_at_ms integer, occurrences integer, last_processed_at text,
       host_correlations text);
     """)
+    # migraties (fase 5): llm-state op incidents, dumbscope-contextvelden
+    for table, col, decl in (
+            ("incidents", "llm_last_analyzed_at", "text"),
+            ("incidents", "llm_last_model", "text"),
+            ("incidents", "llm_summary", "text"),
+            ("incidents", "llm_confidence", "real"),
+            ("incidents", "llm_root_cause", "text"),
+            ("incidents", "llm_analysis_version", "integer default 0"),
+            ("incidents", "llm_context_hash", "text"),
+            ("incidents", "llm_call_count", "integer default 0"),
+            ("dumbscope_incidents", "summary", "text"),
+            ("dumbscope_incidents", "root_cause_service", "text"),
+            ("dumbscope_incidents", "affected_services", "text"),
+            ("dumbscope_incidents", "evidence_json", "text")):
+        cols = [r[1] for r in c.execute(f"pragma table_info({table})")]
+        if col not in cols:
+            c.execute(f"alter table {table} add column {col} {decl}")
     return c
 
 def now_iso():
@@ -444,18 +461,29 @@ def run_dumbscope(cfg, c, events, mode="fast"):
 
     for inc in result["incidents"]:
         fp = inc["fingerprint"]
+        ds_ctx = (json.dumps(inc["evidence"][:10]), inc["summary"],
+                  inc["root_cause_service"], json.dumps(inc["affected_services"]))
         row = c.execute("select incident_id, status, severity, occurrences, last_seen_ms"
                         " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
         if row is None:
-            c.execute("insert into dumbscope_incidents values(?,?,?,?,?,?,?,?,?,?,?)",
+            c.execute("insert into dumbscope_incidents values(?,?,?,?,?,?,?,?,?,?,?,"
+                      "?,?,?,?)",
                       (fp, inc["source_fingerprint"], inc["source_incident_id"], inc["source_status"],
                        inc["severity"], inc["title"], inc["last_seen_ms"], inc["resolved_at_ms"],
-                       inc["occurrences"], now_iso(), json.dumps(hostcor)))
+                       inc["occurrences"], now_iso(), json.dumps(hostcor),
+                       ds_ctx[0], ds_ctx[1], ds_ctx[2], ds_ctx[3]))
             if seeded:
                 emit_ds(inc, "resolved" if inc["state"] == "resolved" else "active",
                         inc["severity"], ["new"], "nieuw DUMBscope-incident")
                 changed += 1
             continue
+        c.execute("update dumbscope_incidents set incident_id=?, status=?, severity=?,"
+                  " occurrences=?, last_seen_ms=?, resolved_at_ms=?, last_processed_at=?,"
+                  " host_correlations=?, summary=?, root_cause_service=?,"
+                  " affected_services=?, evidence_json=? where fingerprint=?",
+                  (inc["source_incident_id"], inc["source_status"], inc["severity"],
+                   inc["occurrences"], inc["last_seen_ms"], inc["resolved_at_ms"], now_iso(),
+                   json.dumps(hostcor), ds_ctx[1], ds_ctx[2], ds_ctx[3], ds_ctx[0], fp))
         inc_id, s_status, s_sev, s_occ, s_last = row
         changed_fields = []
         if s_status != inc["source_status"]:
@@ -466,12 +494,6 @@ def run_dumbscope(cfg, c, events, mode="fast"):
             changed_fields.append(f"severity:{s_sev}->{inc['severity']}")
         if not changed_fields:
             continue  # identieke poll: geen event (§18)
-        c.execute("update dumbscope_incidents set incident_id=?, status=?, severity=?,"
-                  " occurrences=?, last_seen_ms=?, resolved_at_ms=?, last_processed_at=?,"
-                  " host_correlations=? where fingerprint=?",
-                  (inc["source_incident_id"], inc["source_status"], inc["severity"],
-                   inc["occurrences"], inc["last_seen_ms"], inc["resolved_at_ms"], now_iso(),
-                   json.dumps(hostcor), fp))
         # lifecycle: DUMBscope kent active/resolved — Hermes volgt 1-op-1 (§9)
         if inc["source_status"] == "resolved":
             ev_state, sev = "resolved", "normal"
@@ -502,6 +524,142 @@ def run_dumbscope(cfg, c, events, mode="fast"):
     return st
 
 # -------------------------------------------------------------------- fast --
+# ------------------------------------------------------------- llm-laag (5) --
+def needs_llm_analysis(c, fp, severity, state):
+    """Deterministische skip/route-beslissing (§4). Geeft (route, reden).
+    Tier 0 blijft source of truth: bekende oorzaak = geen LLM."""
+    if state != "active":
+        return False, "skip:resolved_of_niet_actief"
+    if severity not in ("warning", "urgent", "critical"):
+        return False, "skip:severity_onder_warning"
+    if fp == "dumbscope:availability":
+        return False, "skip:bekende_oorzaak(availability/auth)"
+    if fp.startswith("dumbscope:"):
+        d = c.execute("select root_cause_service, evidence_json, host_correlations"
+                      " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
+        if d and d[0] and d[1] and d[1] != "[]" and (d[2] in (None, "[]", "")):
+            return False, "skip:duidelijke_root_cause_met_evidence"
+        return True, "route:dumbscope_onzeker_of_multi_system_of_hostcorrelatie"
+    for pref in ("host:cache:high", "host:vm_storage:high", "host:user_share:high",
+                 "host:rootfs:high", "host:logfs:high", "host:logfs:growth",
+                 "host:docker_vdisk:high", "host:docker_vdisk:growth",
+                 "host:memory:high", "host:memory:oom", "host:docker_daemon:down",
+                 "host:swap:active", "host:array:", "host:containers:unhealthy"):
+        if fp.startswith(pref):
+            return False, "skip:bekende_deterministische_oorzaak"
+    if ":restarts" in fp:
+        return False, "skip:simpele_restart_delta"
+    if "_growth" in fp and ":crc" in fp:
+        return False, "skip:crc_delta_zonder_onzekerheid"
+    if fp.startswith("disk:") and ":smart_failed" in fp:
+        return False, "skip:smart_health_expliciet"
+    return True, "route:oorzaak_onbekend"
+
+def build_context(c, fp, sev):
+    """Compacte modelcontext (§5) — hard begrensd door de router-sanitizer/cap."""
+    ctx = {"fingerprint": fp, "severity": sev}
+    row = c.execute("select source, last_value, peak_value, last_reason from incidents"
+                    " where fingerprint=?", (fp,)).fetchone()
+    if row:
+        ctx.update({"source": row[0], "last_value": row[1], "peak": row[2],
+                    "reason": (row[3] or "")[:240]})
+    ms = c.execute("select last_value, slope, trend from metric_state where metric=("
+                   "select case substr(fingerprint, 6) when 'memory:high' then 'mem_used_pct'"
+                   " when 'docker_vdisk:high' then 'vdisk_pct' when 'logfs:high' then 'logfs_pct'"
+                   " when 'cache:high' then 'cache_pct' when 'vm_storage:high' then 'vm_pct'"
+                   " when 'user_share:high' then 'user_pct' when 'rootfs:high' then 'rootfs_pct'"
+                   " when 'temperature:package' then 'package_temp_c'"
+                   " when 'temperature:core' then 'core_max_temp_c' end"
+                   " from incidents where fingerprint=?)", (fp,)).fetchone()
+    if ms and ms[0] is not None:
+        ctx["metric"] = {"last": ms[0], "slope_per_h": ms[1], "direction": ms[2]}
+    others = [r[0] for r in c.execute(
+        "select fingerprint from incidents where state in ('active','recovering')"
+        " and fingerprint != ? and current_severity in ('warning','urgent','critical')", (fp,))]
+    if others:
+        ctx["concurrent_incidents"] = others[:8]
+    d = c.execute("select title, summary, severity, status, root_cause_service,"
+                  " affected_services, occurrences, evidence_json, host_correlations"
+                  " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
+    if d:
+        ctx.update({"title": d[0], "summary": (d[1] or "")[:500], "source_severity": d[2],
+                    "status": d[3], "root_cause_service": d[4],
+                    "affected_services": json.loads(d[5]) if d[5] else [],
+                    "occurrences": d[6],
+                    "evidence": (json.loads(d[7]) if d[7] else [])[:10],
+                    "host_correlations": json.loads(d[8]) if d[8] else []})
+    return ctx
+
+def run_llm_layer(cfg, c, events):
+    """Fase 5: kandidaten -> router (Ling->DeepSeek->GLM->Luna) -> llm-state."""
+    lcfg = dict(cfg.get("llm") or {})
+    if not lcfg.get("enabled", False):
+        return {"llm": "disabled"}
+    try:
+        import hermes_router as hr
+    except Exception as e:
+        return {"llm": f"import_error: {e}"}
+    api_key = hr.load_env_key()
+    if not api_key:
+        return {"llm": "geen OPENROUTER_API_KEY"}
+    today = now_iso()[:10]
+    drow = c.execute("select current_value from counters where name=?",
+                     (f"llm_calls_daily:{today}",)).fetchone()
+    daily = int(drow[0]) if drow else 0
+    stats = {"kandidaten": 0, "tier0_skips": 0, "geanalyseerd": 0, "llm_calls": 0}
+    rows = c.execute("select fingerprint, source, current_severity, state,"
+                     " llm_context_hash, llm_call_count from incidents where state='active'"
+                     " and current_severity in ('warning','urgent','critical')").fetchall()
+    for fp, source, sev, state, chash, ccount in rows:
+        route, why = needs_llm_analysis(c, fp, sev, state)
+        if not route:
+            stats["tier0_skips"] += 1
+            continue
+        stats["kandidaten"] += 1
+        ctx = build_context(c, fp, sev)
+        h = hashlib.sha1(json.dumps(
+            {k: ctx.get(k) for k in ("severity", "occurrences", "reason", "evidence",
+                                     "status", "host_correlations", "last_value")},
+            sort_keys=True, default=str).encode()).hexdigest()[:16]
+        if h == chash:
+            stats["tier0_skips"] += 1
+            continue  # ongewijzigd sinds laatste analyse (§18)
+        bp = bool((cfg.get("llm") or {}).get("baseline_pending", True))
+        final, calls = hr.analyze(fp, source=source or "fast", severity=sev,
+                                  task="incident_analyse", context=ctx, llm_cfg=lcfg,
+                                  api_key=api_key, per_incident_calls=ccount or 0,
+                                  daily_calls=daily)
+        ok_calls = [x for x in calls if x.get("success")]
+        daily += len(ok_calls)
+        c.execute("insert into counters(name, device, previous_value, current_value, delta,"
+                  " last_checked) values(?,?,?,?,?,?) on conflict(name) do update set"
+                  " current_value=excluded.current_value",
+                  (f"llm_calls_daily:{today}", "router", daily - len(ok_calls), daily, len(ok_calls), now_iso()))
+        analysis = final.get("analysis") or {}
+        model = ok_calls[-1].get("actual_model") if ok_calls else None
+        summary = (analysis.get("summary") or analysis.get("diagnosis") or "")[:300]
+        c.execute("update incidents set llm_last_analyzed_at=?, llm_last_model=?, llm_summary=?,"
+                  " llm_confidence=?, llm_root_cause=?, llm_analysis_version=llm_analysis_version+1,"
+                  " llm_context_hash=?, llm_call_count=llm_call_count+? where fingerprint=?",
+                  (now_iso(), model, summary, final.get("confidence"),
+                   ((analysis.get("likely_root_cause") or analysis.get("diagnosis") or ""))[:200],
+                   h, len(calls), fp))
+        stats["geanalyseerd"] += 1
+        stats["llm_calls"] += len(calls)
+        events.append(emit("fast", "llm_analysis", fp, severity=sev,
+                           provisional=bp, state=final.get("status", "done"),
+                           baseline_pending=bp,
+                           reason=(f"{final.get('status')} tier={final.get('tier')} "
+                                   f"calls={len(calls)} conf={final.get('confidence')} "
+                                   f"reason={[x.get('escalation_reason') or x.get('error') for x in calls]}")[:300],
+                           source="llm",
+                           extra={"llm": {"tier": final.get("tier"), "confidence": final.get("confidence"),
+                                          "calls": len(calls),
+                                          "models": [x.get("actual_model") for x in calls],
+                                          "routing_violations": [x.get("routing_violation") for x in calls],
+                                          "summary": summary}}))
+    return stats
+
 PCT_RULES_FAST = [
     ("mem_used_pct", "host:memory:high", "memory", "memory", 0.5),
     ("vdisk_pct", "host:docker_vdisk:high", "docker_vdisk", "docker_vdisk", 0.3),
@@ -663,6 +821,16 @@ def run_fast(cfg, events):
                            reason=f"integratiefout (host-monitoring onaangetast): {type(e).__name__}: {e}"[:240],
                            source="dumbscope"))
         st["dumbscope"] = "integration_error"
+    try:
+        llm_stats = run_llm_layer(cfg, c, events)
+        st.update({f"llm_{k}": v for k, v in llm_stats.items()})
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed (§21-analoog)
+        events.append(emit("fast", "llm_integration", "llm:integration_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"llm-laag faalde (host-monitoring onaangetast): "
+                                  f"{type(e).__name__}: {e}"[:240], source="llm"))
+        st["llm"] = "integration_error"
     active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
     c.commit(); c.close()
     return {"mode": "fast", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
@@ -931,6 +1099,9 @@ SAMPLES_SCHEMA = """create table samples(
 
 def run_test(cfg):
     """Synthetische cases; zelfde codepad als productie (replay + state-db)."""
+    # tests mogen nooit echte LLM-calls maken; routertests mocken het transport
+    cfg = dict(cfg)
+    cfg["llm"] = dict(cfg.get("llm") or {}, enabled=False)
     results = []
     def check(name, cond, detail=""):
         results.append((name, bool(cond), detail))
@@ -1245,6 +1416,219 @@ def run_test(cfg):
     check("onbekende severity -> notice + gemarkeerd",
           len(odd) == 1 and odd[0]["severity"] == "notice" and odd[0].get("severity_unmapped") is True,
           str(odd)[:120])
+    # ── LLM-router (§20) ──
+    import hermes_router as hr
+    rtmp = Path(tempfile.mkdtemp()); (rtmp / "homelab").mkdir(parents=True, exist_ok=True)
+    hr.ROUTER_CALLS = rtmp / "homelab" / "router_calls.jsonl"
+    hr_real_http = hr.http_post_openrouter
+
+    def or_resp(model, content=None, status=200, pt=100, ct=40, rt=0, provider="FakeProv"):
+        if status != 200:
+            return status, None, f"http {status}", 0.05
+        return 200, {"model": model, "provider": provider,
+                     "choices": [{"message": {"content": content}}],
+                     "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                               "prompt_tokens_details": {"cached_tokens": 0},
+                               "completion_tokens_details": {"reasoning_tokens": rt}}}, None, 0.05
+
+    def ling_content(conf=0.95, checks=None, needs=False, wrap=False):
+        c = json.dumps({"summary": "samenvatting", "classification": "known_cause",
+                        "likely_cause": "oorzaak", "confidence": conf,
+                        "needs_more_analysis": needs, "recommended_checks": checks or []})
+        return ("Volgens mij: " + c) if wrap else c
+
+    queue = []
+    captured = []
+    def fake_http(body, key, timeout=75):
+        captured.append(body)
+        return queue.pop(0) if queue else or_resp(body["model"], None, status=500)
+
+    hr.http_post_openrouter = fake_http
+    llmcfg = {"output_max_tokens": {"tier1": 300, "tier2": 600, "tier4": 700},
+              "confidence_stop": 0.85, "max_calls_per_incident": 3, "max_calls_per_day": 8,
+              "ling_input_chars_cap": 4800, "deepseek_input_chars_cap": 24000}
+    dsc = {"fingerprint": "dumbscope:mystery", "severity": "warning",
+           "affected_services": ["plex"], "host_correlations": [], "title": "t",
+           "summary": "s", "status": "active", "occurrences": 1, "evidence": ["e"],
+           "root_cause_service": None}
+
+    # 1: gezonde/normal severity -> geen LLM
+    r, why = needs_llm_analysis(sqlite3.connect(":memory:"), "host:cache:high", "normal", "active")
+    check("router 1: normal -> geen LLM", r is False, why)
+    # 2: simpele deterministische warning -> skip
+    r, why = needs_llm_analysis(sqlite3.connect(":memory:"), "host:cache:high", "warning", "active")
+    check("router 2: deterministische storage-warning -> skip", r is False, why)
+    # 3+4: nieuw onzeker incident -> Ling; conf 0.95 -> stop
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.95))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 3: onzeker incident -> Ling aangeroepen",
+          len(calls_) == 1 and calls_[0]["requested_model"] == hr.MODELS["tier1"],
+          str(len(calls_)))
+    check("router 4: conf 0.95 -> stop bij Ling", final.get("tier") == "tier1", str(final))
+    # 5: conf 0.60 -> DeepSeek
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.60)),
+             or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "likely_root_cause": "rc",
+                                                     "confidence": 0.7, "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 5: conf 0.60 -> DeepSeek", len(calls_) == 2 and final.get("tier") == "tier2",
+          str(len(calls_)))
+    # 6a: Ling ongeldige JSON -> repair faalt -> DeepSeek
+    queue = [or_resp(hr.MODELS["tier1"], "geen json hier"),
+             or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "confidence": 0.7,
+                                                     "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 6a: Ling invalid JSON -> DeepSeek", len(calls_) == 2 and final.get("tier") == "tier2",
+          str(len(calls_)))
+    # 6b: Ling JSON met rommel ervoor -> extractie-repair werkt
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.9, wrap=True))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 6b: Ling JSON-in-tekst -> repair extractie slaagt",
+          final.get("tier") == "tier1", str(final))
+    # 7: Ling 429 -> DeepSeek met expliciete provider-reden
+    queue = [or_resp(hr.MODELS["tier1"], None, status=429),
+             or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "confidence": 0.7,
+                                                     "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 7: Ling 429 -> DeepSeek (ling_provider_error)",
+          len(calls_) == 2 and calls_[1]["escalation_reason"] == "ling_provider_error",
+          str(calls_[1]["escalation_reason"]))
+    # 8: DeepSeek providerfout -> GLM (tier 3)
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.5)),
+             or_resp(hr.MODELS["tier2"], None, status=500),
+             or_resp(hr.MODELS["tier3"], json.dumps({"diagnosis": "g", "confidence": 0.8,
+                                                     "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 8: DeepSeek providerfout -> GLM",
+          len(calls_) == 3 and final.get("tier") == "tier3"
+          and calls_[2]["escalation_reason"] == "deepseek_provider_error", str(final))
+    # 9: DeepSeek conf <0.5 + multi-system CRITICAL -> Luna toegestaan
+    ctx9 = dict(dsc, affected_services=["plex", "sonarr"], severity="critical")
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.45)),
+             or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "confidence": 0.4,
+                                                     "recommended_checks": []})),
+             or_resp(hr.MODELS["tier4"], json.dumps({"diagnosis": "L", "confidence": 0.8,
+                                                     "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="critical",
+                               task="t", context=ctx9, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=True)
+    check("router 9: multi-system CRITICAL conf<0.5 -> Luna",
+          len(calls_) == 3 and final.get("tier") == "tier4", str(final))
+    # 13/14: budget
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=8, multi_system=False)
+    check("router 13: daglimiet -> geen call (audit)",
+          final.get("status") == "skipped" and final.get("reason") == "llm_budget_exhausted:daily",
+          str(final))
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=3, daily_calls=0, multi_system=False)
+    check("router 14: incidentlimiet -> geen call (audit)",
+          final.get("status") == "skipped" and final.get("reason") == "llm_budget_exhausted:incident",
+          str(final))
+    # 15: requested != actual -> routing violation, response onvertrouwd -> DeepSeek
+    queue = [or_resp(hr.MODELS["tier2"], ling_content(0.95)),
+             or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "confidence": 0.7,
+                                                     "recommended_checks": []}))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    check("router 15: requested != actual -> routing_violation + escalatie",
+          calls_ and calls_[0]["routing_violation"] is True and final.get("tier") == "tier2",
+          str(calls_[0].get("routing_violation")) if calls_ else "geen calls")
+    # 16: onbekend diagnostic-command -> gefilterd
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.95, checks=["disk-health", "rm -rf /", "reboot now"]))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    pchecks = (final.get("analysis") or {}).get("recommended_checks")
+    check("router 16: onbekende commands gefilterd",
+          pchecks == ["disk-health"] and "rm -rf /" not in json.dumps(pchecks), str(pchecks))
+    # 17: sanitizer redigeert secrets vóór de call
+    secret_ctx = dict(dsc, summary="key=sk-abcdefghij1234567890 token=bot123456:ABCDEFGHIJKLMNOPQRSTUVWXYZABC"),
+    queue = [or_resp(hr.MODELS["tier1"], ling_content(0.95))]
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=secret_ctx[0], llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=0, multi_system=False)
+    sent = json.dumps(captured[-1])
+    check("router 17: secrets geredigeerd vóór call",
+          "sk-abcdefghij" not in sent and "bot123456:" not in sent
+          and calls_[-1].get("context_redactions", 0) > 0, str(calls_[-1].get("context_redactions")))
+    hr.http_post_openrouter = hr_real_http
+    import shutil as _sh
+    _sh.rmtree(rtmp, ignore_errors=True)
+
+    # 10/11/12: unchanged/escalatie/reopen op evaluator-niveau (hash + analyze-teller)
+    analyze_calls = {"n": 0}
+    def fake_analyze(fp, **kw):
+        analyze_calls["n"] += 1
+        return ({"status": "done", "tier": "tier1", "analysis": {"summary": "ok"},
+                 "confidence": 0.9}, [{"success": True, "actual_model": hr.MODELS["tier1"]}])
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db",
+                     STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    real_analyze = globals().get("run_llm_layer")
+    globals()["make_client"] = globals().get("make_client")
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        con = state_db()
+        con.execute("insert into incidents(fingerprint, source, type, state, current_severity,"
+                    " previous_severity, first_seen, last_seen, last_changed, occurrences,"
+                    " last_value, peak_value, last_alert_at, last_reason)"
+                    " values('dumbscope:mystery','dumbscope','ds','active','warning',"
+                    "'normal','t','t','t',1,1,1,'t','onzeker')")
+        con.execute("insert into dumbscope_incidents(fingerprint, source_fingerprint,"
+                    " incident_id, status, severity, title, last_seen_ms, resolved_at_ms,"
+                    " occurrences, last_processed_at, host_correlations, summary,"
+                    " root_cause_service, affected_services, evidence_json)"
+                    " values('dumbscope:mystery','mystery','i1','active','warning','t',"
+                    "1,2,1,'t','[]','s',NULL,'[\"plex\"]','[\"e\"]')")
+        con.commit()
+        globals()["run_llm_layer_orig"] = None
+        # monkeypatch hr.analyze
+        hr_analyze_real = hr.analyze
+        hr.analyze = fake_analyze
+        llm_on = dict(cfg.get("llm") or {}, enabled=True)
+        llm_on = {"llm": dict(cfg.get("llm") or {}, enabled=True)}
+        s1 = run_llm_layer(llm_on, con, [])
+        h1 = con.execute("select llm_context_hash from incidents where fingerprint='dumbscope:mystery'").fetchone()[0]
+        n1 = analyze_calls["n"]
+        s2 = run_llm_layer(llm_on, con, [])  # ongewijzigd
+        n2 = analyze_calls["n"]
+        con.execute("update incidents set current_severity='critical' where fingerprint='dumbscope:mystery'")
+        con.commit()
+        s3 = run_llm_layer(llm_on, con, [])  # severity escalatie -> nieuw
+        n3 = analyze_calls["n"]
+        con.execute("update incidents set state='resolved', current_severity='normal' where fingerprint='dumbscope:mystery'")
+        con.execute("update incidents set state='active', current_severity='warning' where fingerprint='dumbscope:mystery'")
+        con.execute("update dumbscope_incidents set occurrences=2 where fingerprint='dumbscope:mystery'")
+        con.commit()
+        s4 = run_llm_layer(llm_on, con, [])  # reopen + occurrences -> nieuw
+        n4 = analyze_calls["n"]
+        hr.analyze = hr_analyze_real
+        con.close()
+        check("router 10: ongewijzigd incident -> geen nieuwe analyse", n2 == n1, f"{n1}->{n2}")
+        check("router 11: severity-escalatie -> nieuwe analyse", n3 > n1, f"{n1}->{n3}")
+        check("router 12: reopen/occurrences -> nieuwe analyse", n4 > n3, f"{n3}->{n4}")
+    finally:
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        hr.analyze = hr_analyze_real
+        _sh.rmtree(tmp, ignore_errors=True)
+
 
     fails = [r for r in results if not r[1]]
     for name, okk, detail in results:

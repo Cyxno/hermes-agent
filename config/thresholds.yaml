@@ -98,6 +98,21 @@ dumbscope:
   resolved_poll_limit: 20
   note: "severity-mapping: info->notice, warning->warning, critical->critical; onbekend->notice (gemarkeerd). Wachtwoord uit secrets/dumbscope-admin-password.txt (fallback: arrsight-admin-password.txt); sessie in secrets/dumbscope-session. Alleen GET + login; /api/actions nooit."
 
+llm:
+  baseline_pending: true
+  enabled: true
+  confidence_stop: 0.85
+  max_calls_per_incident: 3
+  max_calls_per_day: 8
+  ling_input_chars_cap: 4800
+  deepseek_input_chars_cap: 24000
+  output_max_tokens:
+    tier1: 300
+    tier2: 1000
+    tier3: 900
+    tier4: 700
+  note: "router: één model per call, allow_fallbacks=false, requested==actual gecontroleerd; Ling zonder response_format en met reasoning uit; GLM alleen als DeepSeek-providerfout; Luna alleen urgent/critical + multi-system + conf<0.5. Gezonde dag = 0 calls."
+
 docker_daemon:
   baseline_pending: true
   unreachable_severity: critical

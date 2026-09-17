@@ -63,3 +63,17 @@ docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
 - Audit: `jq -r '[.ts,.fingerprint,.severity,.state,.reason]|@tsv' homelab/evaluator-events.jsonl`.
 - State: `homelab/agent_state.db` — incidents/metric_state/counters/cursors.
 - Cron: user.scripts "Hermes evaluator fast" (7,22,37,52) + "deep" (23 * * * *).
+
+## LLM-router (fase 5)
+
+```bash
+# live micro-smoketest per tier (gebruikt .env key):
+docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
+  -v /mnt/user/appdata/hermes/data:/opt/data -e HERMES_HOME=/opt/data \
+  nousresearch/hermes-agent:latest /opt/data/scripts/hermes_router.py smoke tier1 5
+```
+
+- Audit: `jq -c '{ts,requested_model,actual_model,confidence,routing_violation,error}' \
+  homelab/router_calls.jsonl`
+- Limieten/drempels: `thresholds.yaml` sectie `llm` (3/incident, 8/dag, conf-stop 0,85).
+- Routerstate: llm_*-kolommen op `incidents` in agent_state.db.
