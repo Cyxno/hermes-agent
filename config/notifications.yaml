@@ -1,0 +1,28 @@
+# notifications.yaml — fase 4.5: deterministic Telegram-alerting policy.
+#
+# De evaluator (hermes_evaluator.py) bepaalt fingerprint/severity/state en is
+# source of truth. Dit bestand bepaalt ALLÉEN wat naar Telegram gaat.
+# Aanpassen = dit bestand wijzigen (deploy via install.sh), geen codewijziging.
+#
+# Hard: deze laag is 100% deterministisch — 0 LLM-calls, 0 tokens,
+# geen remediation/actions. Severity-escalatie negeert cooldowns altijd.
+
+notifications:
+  enabled: true
+  min_severity: warning        # NORMAL/NOTICE -> nooit versturen, alleen state
+  telegram_enabled: true
+  recovery_enabled: true       # één herstelbericht na eerdere WARNING+-melding
+
+  cooldown_hours:
+    warning_unchanged: 4       # unchanged WARNING: geen repeat binnen 4 uur
+    urgent_reminder: 2         # unchanged URGENT: herinnering na 2 uur
+    critical_reminder: 1       # unchanged CRITICAL: herinnering na 1 uur
+
+  retry:
+    base_delay_s: 60           # backoff na mislukte send: 60s, 120s, 240s, ...
+    factor: 2
+    max_delay_s: 900           # max 15 min — geen snelle eindeloze retryloop
+
+  failure_incident_after: 3    # opeenvolgende mislukte sends -> lokaal incident
+                               # notifications:delivery (ALLEEN lokaal gelogd,
+                               # géén Telegram-alert over kapotte Telegram).

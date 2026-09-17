@@ -1102,6 +1102,7 @@ def run_test(cfg):
     # tests mogen nooit echte LLM-calls maken; routertests mocken het transport
     cfg = dict(cfg)
     cfg["llm"] = dict(cfg.get("llm") or {}, enabled=False)
+    cfg["notifications"] = dict(cfg.get("notifications") or {}, enabled=False)  # tests: nooit echt verzenden
     results = []
     def check(name, cond, detail=""):
         results.append((name, bool(cond), detail))
@@ -1653,6 +1654,21 @@ def main():
     events = []
     if mode == "fast":
         summary = run_fast(cfg, events)
+        # fase 4.5: deterministische Telegram-notificatie van state-transities
+        # (geen LLM, geen remediation). Failure-isolated: host-monitoring raakt
+        # het niet als de notifier faalt.
+        if (cfg.get("notifications") or {}).get("enabled", True):
+            try:
+                import hermes_notifier
+                summary["notifications"] = hermes_notifier.run_notifications(
+                    cfg, home=HL, state_db_path=STATE_DB, samples_db_path=SAMPLES_DB)
+            except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+                events.append(emit("fast", "notification_integration",
+                                   "notifications:integration_error", severity="notice",
+                                   provisional=True, state="observed", baseline_pending=True,
+                                   reason=f"notifier faalde (host-monitoring onaangetast): "
+                                          f"{type(e).__name__}: {e}"[:240], source="notifier"))
+                summary["notifications"] = f"error: {type(e).__name__}"
     elif mode == "deep":
         summary = run_deep(cfg, events)
     elif mode == "baseline-report":

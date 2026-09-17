@@ -30,12 +30,14 @@ MAP=(
   "config/config.yaml|$HERMES_APPDATA/data/config.yaml|600|10000|10000"
   "config/SOUL.md|$HERMES_APPDATA/data/SOUL.md|600|10000|10000"
   "config/thresholds.yaml|$HERMES_APPDATA/data/thresholds.yaml|600|10000|10000"
+  "config/notifications.yaml|$HERMES_APPDATA/data/notifications.yaml|600|10000|10000"
   "host/hermes-read-dispatch.sh|/boot/config/plugins/hermes-read-dispatch.sh|700|0|0"
   "host/hermes-operator-dispatch.sh|/boot/config/plugins/hermes-operator-dispatch.sh|700|0|0"
   "host/hermes-host-sampler.sh|/boot/config/plugins/hermes-host-sampler.sh|700|0|0"
   "scripts/hermes_evaluator.py|$HERMES_APPDATA/data/scripts/hermes_evaluator.py|700|10000|10000"
   "scripts/hermes_router.py|$HERMES_APPDATA/data/scripts/hermes_router.py|700|10000|10000"
   "scripts/hermes_dumbscope.py|$HERMES_APPDATA/data/scripts/hermes_dumbscope.py|700|10000|10000"
+  "scripts/hermes_notifier.py|$HERMES_APPDATA/data/scripts/hermes_notifier.py|700|10000|10000"
 )
 
 pending=0; installed=0; same=0; skipped=0

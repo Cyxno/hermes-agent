@@ -64,7 +64,22 @@ docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
 - State: `homelab/agent_state.db` — incidents/metric_state/counters/cursors.
 - Cron: user.scripts "Hermes evaluator fast" (7,22,37,52) + "deep" (23 * * * *).
 
-## LLM-router (fase 5)
+## Telegram-notificaties (fase 4.5, deterministisch)
+
+- `hermes_notifier.py` — 100% deterministic: geen LLM, geen remediation.
+- Policy: `config/notifications.yaml` (min_severity, cooldowns, retry/backoff).
+  NORMAL/NOTICE -> nooit; WARNING -> alleen nieuw/escalatie; URGENT/CRITICAL ->
+  direct (+ reminder na cooldown); RESOLVED -> één herstelbericht na eerdere melding.
+- Escalatie negeert cooldowns altijd; unchanged incidents worden niet herhaald.
+- Integratie: evaluator `fast` roept de notifier na afloop aan (failure-isolated);
+  ook standalone: `… python hermes_notifier.py run|test|send-test`.
+- Audit: `jq -c '{ts,fingerprint,severity,event,attempted,delivered,error}' homelab/notifications.jsonl`.
+- Token: uitsluitend `TELEGRAM_BOT_TOKEN`/`TELEGRAM_HOME_CHANNEL` in `data/.env`
+  (nooit gelogd, nooit in Git of state-db).
+- Delivery-failure: pending + retry met backoff (60s→max 15min); ≥3 mislukkingen
+  achter elkaar = lokaal incident `notifications:delivery`, geen Telegram-recursie.
+
+## LLM-router (fase 5) — NOG NIET ACTIEF (llm.enabled: false)
 
 ```bash
 # live micro-smoketest per tier (gebruikt .env key):
