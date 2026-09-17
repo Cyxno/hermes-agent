@@ -95,6 +95,8 @@ def state_db():
       delta real, last_checked text);
     create table if not exists cursors(
       name text primary key, value text, last_checked text);
+    create table if not exists prom_history(
+      metric text primary key, updated_at text, data_json text);
     create table if not exists dumbscope_incidents(
       fingerprint text primary key, source_fingerprint text, incident_id text,
       status text, severity text, title text, last_seen_ms integer,
@@ -578,6 +580,13 @@ def build_context(c, fp, sev):
         " and fingerprint != ? and current_severity in ('warning','urgent','critical')", (fp,))]
     if others:
         ctx["concurrent_incidents"] = others[:8]
+    try:
+        import hermes_prometheus as hprom
+        trends = hprom.llm_trend_lines(c, fp)
+        if trends:
+            ctx["prom_trends"] = trends  # compact, max ~8 regels (fase 6)
+    except Exception:  # noqa: BLE001 — context is best-effort, nooit kritiek
+        pass
     d = c.execute("select title, summary, severity, status, root_cause_service,"
                   " affected_services, occurrences, evidence_json, host_correlations"
                   " from dumbscope_incidents where fingerprint=?", (fp,)).fetchone()
@@ -831,6 +840,21 @@ def run_fast(cfg, events):
                            reason=f"llm-laag faalde (host-monitoring onaangetast): "
                                   f"{type(e).__name__}: {e}"[:240], source="llm"))
         st["llm"] = "integration_error"
+    # Prometheus historische context (fase 6): optioneel, selectief, read-only.
+    # Faalt Prometheus, dan crasht dit nooit en valt alles terug op samples.db.
+    try:
+        import hermes_prometheus as hprom
+        if (cfg.get("prometheus") or {}).get("enabled", True):
+            prom = hprom.run_prometheus_context(cfg, c, events, home=HL, emit=emit, mode="fast")
+            st["prometheus"] = {k: v for k, v in prom.items() if k != "history"}
+            st["prom_metrics"] = sorted(prom.get("history", {}))
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed (§21-analoog)
+        events.append(emit("fast", "prometheus_integration", "prometheus:integration_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"prometheus-context faalde (host-monitoring onaangetast): "
+                                  f"{type(e).__name__}: {e}"[:240], source="prometheus"))
+        st["prometheus"] = "integration_error"
     active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
     c.commit(); c.close()
     return {"mode": "fast", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
@@ -1103,6 +1127,7 @@ def run_test(cfg):
     cfg = dict(cfg)
     cfg["llm"] = dict(cfg.get("llm") or {}, enabled=False)
     cfg["notifications"] = dict(cfg.get("notifications") or {}, enabled=False)  # tests: nooit echt verzenden
+    cfg["prometheus"] = dict(cfg.get("prometheus") or {}, enabled=False)  # tests: geen live HTTP
     results = []
     def check(name, cond, detail=""):
         results.append((name, bool(cond), detail))

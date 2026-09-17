@@ -38,6 +38,7 @@ MAP=(
   "scripts/hermes_router.py|$HERMES_APPDATA/data/scripts/hermes_router.py|700|10000|10000"
   "scripts/hermes_dumbscope.py|$HERMES_APPDATA/data/scripts/hermes_dumbscope.py|700|10000|10000"
   "scripts/hermes_notifier.py|$HERMES_APPDATA/data/scripts/hermes_notifier.py|700|10000|10000"
+  "scripts/hermes_prometheus.py|$HERMES_APPDATA/data/scripts/hermes_prometheus.py|700|10000|10000"
 )
 
 pending=0; installed=0; same=0; skipped=0

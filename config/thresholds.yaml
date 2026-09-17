@@ -98,6 +98,20 @@ dumbscope:
   resolved_poll_limit: 20
   note: "severity-mapping: info->notice, warning->warning, critical->critical; onbekend->notice (gemarkeerd). Wachtwoord uit secrets/dumbscope-admin-password.txt (fallback: arrsight-admin-password.txt); sessie in secrets/dumbscope-session. Alleen GET + login; /api/actions nooit."
 
+prometheus:
+  baseline_pending: true
+  enabled: true
+  base_url: "http://192.168.1.2:9090"
+  timeout_s: 5
+  freshness_s: 600        # oudere data = stale -> genegeerd (samples.db fallback)
+  cache_ttl_s: 600
+  max_queries_per_run: 4  # max metrics per evaluator-run; <=2 ranges per metric
+  failure_notice_polls: 3   # lokaal notice-event (geen Telegram)
+  failure_warning_polls: 12 # langdurig (~3u) -> warning -> fase-4.5 policy
+  note: "READ-ONLY (fase 6). Prometheus = langere historie; SSH/sampler blijft
+    CURRENT-truth, samples.db = korte historie/fallback. Uitval is nooit een
+    harde dependency: alleen context ontbreekt."
+
 llm:
   baseline_pending: true
   # fase 5 ACTIEF (sinds Stap C van de vervolgfase): limits hieronder gelden.

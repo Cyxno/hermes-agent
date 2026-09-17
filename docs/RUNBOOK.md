@@ -79,6 +79,23 @@ docker run --rm -u 10000:10000 --entrypoint /opt/hermes/.venv/bin/python \
 - Delivery-failure: pending + retry met backoff (60s→max 15min); ≥3 mislukkingen
   achter elkaar = lokaal incident `notifications:delivery`, geen Telegram-recursie.
 
+## Prometheus historische context (fase 6, optioneel)
+
+- `hermes_prometheus.py` — READ-ONLY (instant/range), geen Grafana, geen credentials.
+- Source-of-truth: CURRENT = SSH/sampler; kort = samples.db; lang = Prometheus.
+  Prometheus overschrijft nooit een actuele SSH-waarde; stale data (>
+  `freshness_s`) wordt genegeerd.
+- Selectief: alleen bij relevante actieve incidenten (RAM/temp/storage-growth),
+  max `max_queries_per_run` metrics per run, TTL-cache 600s.
+- Degraded mode: bij uitval valt alles terug op samples.db; na 3 mislukte runs
+  een lokaal notice-incident, na 12 (~3u) warning -> fase-4.5 Telegram-policy.
+  Bij herstel RESOLVED. Prometheus is nooit een harde dependency.
+- LLM-context: `prom_trends` in de router-context — max 8 compacte regels,
+  geen ruwe series.
+- Handmatig: `… python hermes_prometheus.py dry-run|test`.
+- Audit/context: tabel `prom_history` in agent_state.db; events in
+  evaluator-events.jsonl (check=prometheus_context/prometheus_availability).
+
 ## LLM-router (fase 5) — ACTIEF (llm.enabled: true, Stap C)
 
 ```bash
