@@ -521,15 +521,22 @@ def run_dumbscope(cfg, c, events, mode="fast"):
         for inc_ in result["incidents"]:
             if inc_["state"] != "active":
                 continue
+            # Seed-semantiek (fase 9, herzien): state wél vastleggen, maar de
+            # notificatie-graad dempen naar notice (zelfde patroon als de
+            # infinidysk-seed). notice < min_severity => geen Telegram, en
+            # needs_llm_analysis skip't onder warning => geen LLM bij koppeling.
+            # De reële severity staat in last_reason; de eerste échte transitie
+            # (escalatie/heropen) gaat via de machine en notificeert wél.
             c.execute("insert or ignore into incidents(fingerprint, source, type, state,"
                       " current_severity, previous_severity, first_seen, last_seen,"
                       " last_changed, occurrences, last_value, peak_value, last_alert_at,"
                       " last_reason) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (inc_["fingerprint"], "dumbscope", "dumbscope", "active",
-                       inc_["severity"], "normal", now, inc_["last_seen"] or now, now,
+                       "notice", "normal", now, inc_["last_seen"] or now, now,
                        inc_["occurrences"] or 1, float(inc_["occurrences"] or 0),
                        float(inc_["occurrences"] or 0), now,
-                       f"seed: {inc_['title']}"[:200]))
+                       f"seed: {inc_['title']} (reële severity {inc_['severity']};"
+                       f" gedempt naar notice bij koppeling — geen notificatie/LLM)"[:200]))
         c.execute("insert into cursors(name, value, last_checked)"
                   " values('dumbscope:incidents_seeded', '1', ?) on conflict(name)"
                   " do update set value=excluded.value, last_checked=excluded.last_checked",
@@ -540,7 +547,8 @@ def run_dumbscope(cfg, c, events, mode="fast"):
                            severity="normal", provisional=bp, state="seeded",
                            baseline_pending=bp, source="dumbscope",
                            reason="actieve DUMBscope-incidenten overgenomen in de centrale"
-                                  " incident-machine (geen notificaties)"))
+                                  " incident-machine (severity gedempt naar notice:"
+                                  " geen notificatie/LLM bij seed)"))
 
     def emit_ds(inc, ev_state, sev, changed_fields, reason):
         events.append(emit(mode, "dumbscope_incident", inc["fingerprint"],
@@ -3412,6 +3420,26 @@ def run_test(cfg):
     inc, evs, pend = gap_run([15, "NO_DB", 46])
     check("GAP6b: DB-failure tussen stale polls -> incident blijft bestaan",
           inc.get(SFP) == ("active", "urgent"), str(inc.get(SFP)))
+
+    FPS2 = "dumbscope:mount:s1"
+    inc, evs, pend = ds_run([[ds_inc("s1")]])
+    route, why = needs_llm_analysis(sqlite3.connect(":memory:"), FPS2, "notice", "active")
+    check("DS8: initial seed -> state vastgelegd als notice, GEEN pending, GEEN llm-route",
+          inc.get(FPS2) == ("active", "notice")
+          and not any(p[0] == FPS2 for p in pend)
+          and route is False and "severity" in why, str((inc.get(FPS2), pend, route, why)))
+    inc, evs, pend = ds_run([[ds_inc("s1")],
+                             [ds_inc("s1", severity="critical", occurrences=2)]])
+    check("DS9: escalatie na seed -> wél critical-pending (notificatie hersteld)",
+          inc.get(FPS2) == ("active", "critical")
+          and any(p[0] == FPS2 and p[1] == "escalated" and p[2] == "critical"
+                  for p in pend), str((inc.get(FPS2), pend)))
+    inc, evs, pend = ds_run([[ds_inc("s1")],
+                             [ds_inc("s1", status="resolved", occurrences=2)]])
+    check("DS10: recovery na seed -> stil resolved, geen pending",
+          inc.get(FPS2, ("", ""))[0] == "resolved"
+          and any(e["fingerprint"] == FPS2 and e.get("state") == "resolved" for e in evs)
+          and not any(p[0] == FPS2 for p in pend), str((inc.get(FPS2), pend)))
 
     fails = [r for r in results if not r[1]]
     for name, okk, detail in results:

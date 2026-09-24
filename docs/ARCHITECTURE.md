@@ -229,14 +229,16 @@ Telegram dus nooit. Nu gaat élke DUMBscope-transitie via `incident_upsert()`:
   occurrences-only wijzigingen zijn `none` (geen duplicate-alerts);
 - de-escalatie binnen actief: incident blijft op hoogste severity tot
   herstel (conservatief, zelfde gedrag als de netdata-spiegel);
-- eerste run na activering: actieve incidenten worden stilletjes overgenomen
-  in `incidents` (cursor `dumbscope:incidents_seeded`, event
-  `dumbscope:incidents_seeded`) — geen deploy-storm; pas échte transities
-  na die seed worden genotificeerd;
+- eerste run na activering: actieve incidenten worden overgenomen in
+  `incidents` (cursor `dumbscope:incidents_seeded`) met de notificatie-graad
+  gedempt naar notice (huispatroon, zie InfiniDysk-seed): geen Telegram, geen
+  LLM-bij-koppeling; de reële severity staat in last_reason en de eerste échte
+  transitie daarna (escalatie/heropen/herstel) notificeert wél;
 - `dumbscope_incidents` blijft bestaan als detail/history-bron en als
   dekkings-check voor de netdata container-dedup (fase 8);
-- tests: DS1–DS7 (nieuw warning/critical, escalatie, duplicate, recovery,
-  heropen, en netdata+DUMBscope zelfde storing → één keten, evidence-only).
+- tests: DS1–DS10 (nieuw warning/critical, escalatie, duplicate, recovery,
+  heropen, netdata+DUMBscope zelfde storing → één keten (evidence-only), en
+  seed-stilte: notice-demping, geen pending/LLM, escalatie daarna wél).
 
 ### 9b. Sampler-gap-detectie (`hermes:sampler:stale`)
 

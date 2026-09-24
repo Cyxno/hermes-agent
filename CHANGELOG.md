@@ -29,3 +29,12 @@
 
 Zie `docs/history/` en de git-geschiedenis (fase 0–7: sampler, evaluator,
 deep-checks, DUMBscope-poll, notifier, LLM-router, Prometheus-context).
+
+## 2026-09-24 (2) — seed-semantiek DUMBscope-centraal gerepareerd
+
+- De initial seed van actieve DUMBscope-incidenten in de centrale
+  incident-machine dempt de notificatie-graad naar notice (huispatroon,
+  zie InfiniDysk-seed): state wél vastgelegd, géén Telegram en géén
+  LLM-analyse bij koppeling; reële severity in last_reason; de eerste
+  echte transitie daarna (escalatie/heropen) notificeert wél.
+- Tests: DS8-DS10 (125/125). gepusht naar github.com/Cyxno/hermes-agent.
