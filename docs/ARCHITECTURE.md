@@ -158,3 +158,106 @@ DeepSeek-conf < 0,5.
 - **Sanitizer** redigeert secretpatronen vóór iedere call (getest).
 - In testmodus (`hermes_evaluator.py test`) staat de llm-laag uit: tests maken
   nooit echte modelcalls; de routertests mocken het transport.
+
+## Fase 8 — Netdata-alarminput (bron C, polling, READ-ONLY)
+
+`scripts/hermes_netdata.py` + `run_netdata()` in de fast evaluator (elke
+15 min, failure-isolated). Netdata is een EXTRA signaalbron die Hermes'
+blinde vlekken dicht (CPU-utilisatie, load, iowait, per-container health,
+net-drops, thermals) — nooit een aparte alert-engine: alle severity-state,
+dedup en Telegram-policy blijven bij de bestaande incident-machine en
+notifier.
+
+- **Poll:** uitsluitend `GET /api/v1/alarms` (alleen niet-CLEAR alarms; licht
+  endpoint — de zware `/all`- en transitions-query's hangen onder load).
+  Read-only richting Netdata: nooit alerts/silencers/health-config wijzigen.
+- **Allowlist (geen blind doorsturen):** container-health
+  (`docker_local.container_*_health_status`), host-CPU/iowait, load1/5/15,
+  ram, out-of-memory-space-time, swap, disk space/inode, net-drops/fifo,
+  thermals. Cgroup-alarms (VM-ruis), alle niet-WARNING/CRITICAL-statussen
+  (Clear/Undefined/Removed — de voorbijvliegende korte containers) en
+  gesilenceerde/disabled alarms worden genegeerd.
+- **Dedup/correlatie (hermes blijft leidend):** covered metrics (memory,
+  temperaturen, disk-space, containers via dumbscope/unhealthy-incident) zijn
+  evidence-only: een netdata-WARNING levert alléén een audit-event; een
+  netdata-CRITICAL wordt alleen op het bestaande hermes-fingerprint
+  geëscaleerd als de laatste hermes-sample het bevestigt (memory/storage:
+  eigen warn-drempel; temperaturen: urgent-drempel i.v.m. het bimodale
+  nachtelijke temperatuurpatroon). Uncovered onderwerpen (cpu/iowait, load,
+  per-container health, net-drops, swap, oom-space-time) gaan via
+  incident_upsert → bestaande notifier-policy (min_severity, cooldowns,
+  recovery-once) — daarmee is geen dubbelle Telegram-alert mogelijk.
+- **Lifecycle:** eerste geslaagde poll = seed (state vastleggen, geen events —
+  geen alarmstorm bij eerste deployment). Daarna: nieuw alarm → incident;
+  identiek alarm → niets (§18-analoog); escalatie warning→critical →
+  escalatie; alarm verdwenen na geslaagde poll → recovery (notifier stuurt
+  maximaal één herstelbericht na eerdere melding). Mislukte polls raken de
+  alarm-state niet (geen valse recoveries); ≥3 opeenvolgende mislukkingen →
+  warning `netdata:availability`, ≥12 → urgent, herstel → resolved
+  (dumbscope-patroon).
+- **State:** `netdata_alarms`-tabel (fingerprint=`netdata:<kind>:…`, laatste
+  status/waarde, alert_state) + cursors (`netdata:last_poll`, `:failures`,
+  `:seeded`) in agent_state.db. Events: `evaluator-events.jsonl` met
+  `source="netdata"`, `dedup`-label (covered_evidence_only /
+  covered_confirmed_critical) en het ruwe alarm in `netdata`-extra.
+- **Config:** thresholds.yaml `[netdata]` (base_url :19999, timeout 8 s,
+  failure-drempels). Tests: ND1–ND7 in `run_test` (client gemockt, geen live
+  HTTP): ruisfilter/allowlist, covered-warning + hermes-normal → geen alert,
+  critical + bevestigende sample → escalatie zonder duplicaat, duplicate,
+  recovery, stale, en Netdata-onbereikbaar (inclusief "state onaangeroerd bij
+  mislukte poll").
+
+## Fase 9 — harde koppelingen: DUMBscope centraal + sampler-gap
+
+Twee gaten uit de incident-analyse van 2026-09-24 (Netdata-alerts zonder
+Hermes-signalering) structureel gesloten; geen nieuwe functionaliteit
+daarnaast.
+
+### 9a. DUMBscope → centrale incident-machine
+
+`run_dumbscope()` schreef incidenten alléén in `dumbscope_incidents` (detail/
+history); de notifier leest uitsluitend `incidents` — criticals bereikten
+Telegram dus nooit. Nu gaat élke DUMBscope-transitie via `incident_upsert()`:
+
+- fingerprint ongewijzigd (`dumbscope:<source-fp>`, zelfde als
+  `dumbscope_incidents` en de eventlog) — de notifier verrijkt het bericht
+  via `load_dsi()` met title/root-cause/affected uit de detailtabel;
+- nieuw (warning+) → pending → Telegram via de bestaande policy (min_severity,
+  cooldowns; escalatie negeert cooldown);
+- herstel (status resolved) → machine resolved → recovery precies eenmaal;
+- heropen na resolve → reopened → direct bericht (bestaande semantiek);
+  occurrences-only wijzigingen zijn `none` (geen duplicate-alerts);
+- de-escalatie binnen actief: incident blijft op hoogste severity tot
+  herstel (conservatief, zelfde gedrag als de netdata-spiegel);
+- eerste run na activering: actieve incidenten worden stilletjes overgenomen
+  in `incidents` (cursor `dumbscope:incidents_seeded`, event
+  `dumbscope:incidents_seeded`) — geen deploy-storm; pas échte transities
+  na die seed worden genotificeerd;
+- `dumbscope_incidents` blijft bestaan als detail/history-bron en als
+  dekkings-check voor de netdata container-dedup (fase 8);
+- tests: DS1–DS7 (nieuw warning/critical, escalatie, duplicate, recovery,
+  heropen, en netdata+DUMBscope zelfde storing → één keten, evidence-only).
+
+### 9b. Sampler-gap-detectie (`hermes:sampler:stale`)
+
+De host-sampler v.a. 12:25→17:05 UTC op 2026-09-24 produceerde géén samples
+precies tijdens de CPU-critical; syslog toonde géén sampler-fout en géén
+flock-skips (de sampler logt alléén bij fout) — het proces is toen gewoon
+niet (op tijd) gestart onder load 250+. De sampler zelf is onveranderd; de
+evaluator detecteert het stilvallen voortaan zelf:
+
+- in `run_fast`: leeftijd van de laatste sample uit samples.db (max ts);
+  >10 min → warning, >30 min → urgent (escalatie), herstel zodra er weer een
+  actuele sample is (recovery precies eenmaal; het event/toestelbericht
+  noemt de piek-staleness in minuten);
+- herhaalde polls op dezelfde hoogte zijn `none` (geen reminder-spam);
+- samples.db onleesbaar/afwezig is géén signaal: state onaangeroerd, nooit
+  een valse recovery;
+- tests: GAP1–GAP6b (5/15/45 min, escalatie, geen duplicates, één recovery,
+  DB-failure → geen valse recovery).
+
+### Testinfrastructuur
+
+`run_test` patcht standaard de netdata- en dumbscope-clients (geen live HTTP
+meer in tests); scenario-helpers (`nd_run`, `ds_run`, `gap_run`) overschrijven
+de mocks per tmp-state en herstellen ze.
