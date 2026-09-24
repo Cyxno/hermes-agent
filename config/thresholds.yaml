@@ -15,6 +15,15 @@
 # Overkoepelend: OOM-kill event, read-only remount of niet-gemounte Docker-vDisk
 # zijn ALTIJD direct CRITICAL, onafhankelijk van deze banden.
 # Swap-activering alleen is maximaal WARNING (host heeft standaard geen swap).
+#
+# FASE-4-REVIEW (2026-09-20, 48u samples n=576 + 7d Prometheus):
+# geen enkele numerieke drempel aangepast. Onderbouwing per sectie in het
+# fase-4-rapport; kern: opslag/log/vdisk-banden zitten ver boven de gemeten
+# baselines (p99 < warn overal) en zijn capaciteitsgrenzen, geen idle-tuning;
+# temperaturen zijn bimodaal (nachtelijk 91-100C) — band 90/95/100 + notice-cap
+# + sustained doet precies wat ontworpen; memory vergelijkbaar. Hiermee is de
+# bestaande waarde per metric "logisch" en is wijzigen niet datagedragen.
+# baseline_pending blijft true pending expliciete operator-goedkeuring.
 
 version: 1
 
@@ -53,9 +62,10 @@ docker_vdisk:
   warn_pct: 85
   urgent_pct: 90
   critical_pct: 95
-  growth_warn_gb_per_24h: 2
+  growth_warn_gb_per_hour: 2
   source: "df -kP /var/lib/docker (loop2, xfs) = GUI-authoritatief"
   not_mounted_severity: critical
+  note: "growth-grens is per UUR (GiB/uur); d1h wordt niet meer geëxtrapoleerd naar 24u"
 
 logfs:
   baseline_pending: true
@@ -74,14 +84,20 @@ storage:
 
 temperatures:
   baseline_pending: true
-  package_warn_c: 90
-  package_urgent_c: 95
+  package_warn_c: 95
+  package_urgent_c: 98
   package_critical_c: 100
+  critical_needs_sustain: true
+  urgent_sustained_samples: 3
   ssd_warn_c: 60
   ssd_urgent_c: 70
-  sustained_minutes: 15
-  rise_urgent_ppc_per_hour: 5
-  note: "één hoge sample = max provisional NOTICE; pas bij sustains/rise een band omhoog"
+  sustained_minutes: 10
+  note: "§7b micro-spike-beleid (2026-09-23, high-res CPU-audit): één sample >=95
+    = notice (geen Telegram), 2 opeenvolgende >=95 = warning, >=95 sustained
+    >=10 min (3 samples à 5 min) = urgent, één 100C-sample = notice
+    (critical_needs_sustain — de volgende sample moet bevestigen), sustained
+    100C = critical. Geen rate-escalatie meer voor temperaturen; geen
+    Telegram bij notice (alerts.notice_send=false + notifier min_severity)."
 
 recovery:
   baseline_pending: true
@@ -111,6 +127,15 @@ prometheus:
   note: "READ-ONLY (fase 6). Prometheus = langere historie; SSH/sampler blijft
     CURRENT-truth, samples.db = korte historie/fallback. Uitval is nooit een
     harde dependency: alleen context ontbreekt."
+
+netdata:
+  baseline_pending: true
+  enabled: true
+  base_url: "http://192.168.1.2:19999"
+  timeout_s: 8
+  failure_warning_polls: 3
+  failure_urgent_polls: 12
+  note: "READ-ONLY (fase 8): uitsluitend GET /api/v1/alarms; nooit alerts/silencers wijzigen. Allowlist: container-health, host-CPU/iowait, load, ram, oom-space-time, swap, disk space/inode, net-drops/fifo, thermals; cgroups en overige alarms genegeerd (geen blind doorsturen). Dedup: covered metrics (memory, temperaturen, disk-space, containers via dumbscope/unhealthy) zijn evidence-only; netdata-critical telt daar alleen bij bevestiging door eigen hermes-sample. Covered = hermes blijft leidend. Recovery = alarm verdwijnt uit de active-set na een geslaagde poll; mislukte polls raken state niet."
 
 llm:
   baseline_pending: true
@@ -158,3 +183,30 @@ alerts:
   urgent_send_immediately: true
   critical_send_immediately: true
   resolved_send_once: true
+
+correlation:
+  baseline_pending: true
+  enabled: true
+  window_hours: 2
+  max_items: 5
+  occurrence_days: 7
+  occurrence_min: 3
+  cluster_minutes: 150
+  note: "fase 4: deterministische change-correlation + recurrentie-detectie.
+    Gezonde runs: 0 LLM-calls, hooguit een stat()-call (deploy-log cursor).
+    Correlation levert hypotheses/context, nooit causaliteit. Bronnen:
+    container started/state (deep), deploy/rollback-events
+    (homelab/changes-deploy.jsonl), parity/resync-start; occurrence_log
+    (new/escalated/reopened) voor patronen. Minder dan occurrence_min
+    occurrences binnen occurrence_days dagen = expliciet geen patroonclaim."
+
+infinidysk:
+  baseline_pending: true
+  log_path: "/opt/dumblog/infinidysk.log"
+  log_tz: "Europe/Amsterdam"
+  warning_count: 5
+  urgent_count: 10
+  window_minutes: 60
+  resolve_after_minutes: 120
+  initial_backlog_hours: 24
+  note: "fase 7: per-bestand repair-loop-detectie (read-only hostlog via /opt/dumblog-mount). >=5 repairs/60min = warning, >=10 = urgent, 1-4 blijft open als notice tot 120 min rust -> resolved (bestaande state-machine). Dedup: alleen new/escalated/reopened/resolved zijn notificatie-waardig, identieke runs geen event. Bekende reden (430/no such article/missing articles/DMCA/missing segments) = Tier-0 LLM-skip; onzekere reden route naar bestaande LLM-policy. Fingerprint = genormaliseerd pad (hoofdletters, /content/<cat>/-wortel, kopie-suffix '(2)' op releasedir geneutraliseerd); ander bestand = ander incident. Retentie: repairs 3h (cap 20k), loop-state 7d zonder repairs (cap 500)."

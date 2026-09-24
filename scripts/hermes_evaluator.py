@@ -14,7 +14,7 @@ Modes:
 DRY-RUN: geen LLM, geen Telegram, geen remediation, geen DUMBscope, geen
 Prometheus. Output: agent_state.db + evaluator-events.jsonl (alleen lokaal log).
 """
-import json, hashlib, math, os, re, shutil, sqlite3, statistics, subprocess, sys, tempfile, uuid
+import json, hashlib, math, os, re, shutil, sqlite3, statistics, subprocess, sys, tempfile, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -102,7 +102,27 @@ def state_db():
       status text, severity text, title text, last_seen_ms integer,
       resolved_at_ms integer, occurrences integer, last_processed_at text,
       host_correlations text);
+    create table if not exists infinidysk_repairs(
+      fingerprint text, ts integer, kind text, ts_iso text,
+      primary key(fingerprint, ts, kind));
+    create table if not exists infinidysk_loop(
+      fingerprint text primary key, display text, last_reason text,
+      updated_at text);
+    create table if not exists pending_transitions(
+      id integer primary key autoincrement,
+      fingerprint text not null, ts text, event_type text, severity text,
+      reason text);
+    create table if not exists changes(
+      kind text, key text, ts text, detail text, primary key(kind, key, ts));
+    create table if not exists occurrence_log(
+      fingerprint text, ts text, severity text, primary key(fingerprint, ts));
+    create table if not exists netdata_alarms(
+      fingerprint text primary key, name text, chart text, kind text, subject text,
+      last_status text, last_severity text, last_value real, alert_state text,
+      first_seen text, last_seen text, resolved_at text, last_reason text);
     """)
+    c.execute("create index if not exists idx_occurrence_fp"
+              " on occurrence_log(fingerprint, ts)")
     # migraties (fase 5): llm-state op incidents, dumbscope-contextvelden
     for table, col, decl in (
             ("incidents", "llm_last_analyzed_at", "text"),
@@ -145,6 +165,26 @@ def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
     """Deterministische incident-state-machine -> (state, event_type)."""
     now = now_iso()
     sev = NAME[sev_level]
+
+    def record_pending(etype_, why):
+        """Replay-veiligheid: notificatie-waardige transitie (>= warning)
+        onverliesbaar vastleggen. De notifier (fase 4.5) blijft policy-leidend:
+        zonder deze vastlegging zou een transitie verdwijnen als het incident
+        binnen dezelfde replay-run alweer resolved raakt."""
+        if etype_ in ("new", "escalated", "reopened") and sev_level >= 2:
+            c.execute("insert into pending_transitions(fingerprint, ts, event_type,"
+                      " severity, reason) values(?,?,?,?,?)",
+                      (fp, now, etype_, sev, (why or "")[:200]))
+
+    def record_occurrence():
+        """Fase 4: occurrence-historie voor deterministische recurrentie-
+        detectie; alleen bij nieuwe episode-transities (goedkoop, begrensd)."""
+        try:
+            import hermes_changes as hc
+            hc.record_occurrence(c, fp, now, sev)
+        except Exception:  # noqa: BLE001 — recurrentie-bron mag nooit storen
+            pass
+
     row = c.execute("select state, current_severity, occurrences, peak_value from incidents"
                     " where fingerprint=?", (fp,)).fetchone()
     if row is None:
@@ -156,13 +196,15 @@ def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
                   " values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (fp, source, itype, "active", sev, "normal", now, now, now, 1,
                    value, value, now, reason))
+        record_pending("new", reason)
+        record_occurrence()
         return "active", "new"
     state, cur_sev, occ, peak = row[0], row[1], row[2], row[3]
     if sev_level <= 0 and state in ("active", "recovering"):
         # non-pct regels: eerste goede waarde lost direct op (pct heeft eigen recovery-pad)
         c.execute("update incidents set state='resolved', current_severity='normal',"
                   " previous_severity=?, last_changed=?, resolved_at=?, good_samples=0,"
-                  " last_reason=? where fingerprint=?",
+                  " llm_call_count=0, last_reason=? where fingerprint=?",
                   (cur_sev, now, now, "opgelost: waarde terug op normaal", fp))
         return "resolved", "resolved"
     prev_level = LEVELS.get(cur_sev, 0)
@@ -171,8 +213,11 @@ def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
         if sev_level >= 2:
             c.execute("update incidents set state='active', current_severity=?, previous_severity=?,"
                       " occurrences=occurrences+1, last_seen=?, last_changed=?, resolved_at=NULL,"
-                      " good_samples=0, peak_value=?, last_value=?, last_reason=? where fingerprint=?",
+                      " good_samples=0, llm_call_count=0, peak_value=?, last_value=?, last_reason=?"
+                      " where fingerprint=?",
                       (sev, cur_sev, now, now, peak, value, reason, fp))
+            record_pending("reopened", reason)
+            record_occurrence()
             return "active", "reopened"
         c.execute("update incidents set last_seen=?, last_value=? where fingerprint=?", (now, value, fp))
         return "resolved", "none"
@@ -182,6 +227,8 @@ def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
                       " occurrences=occurrences+1, last_seen=?, last_changed=?, good_samples=0,"
                       " peak_value=?, last_value=?, last_reason=? where fingerprint=?",
                       (sev, cur_sev, now, now, peak, value, reason, fp))
+            record_pending("escalated", reason)
+            record_occurrence()
             return "active", "escalated"
         c.execute("update incidents set last_seen=?, last_value=? where fingerprint=?", (now, value, fp))
         return "recovering", "none"
@@ -190,6 +237,8 @@ def incident_upsert(c, fp, *, source, itype, sev_level, value, reason):
         c.execute("update incidents set current_severity=?, previous_severity=?, last_seen=?,"
                   " last_changed=?, peak_value=?, last_value=?, last_reason=? where fingerprint=?",
                   (sev, cur_sev, now, now, peak, value, reason, fp))
+        record_pending("escalated", reason)
+        record_occurrence()
         return "active", "escalated"
     c.execute("update incidents set last_seen=?, last_value=?, peak_value=?, last_reason=? where fingerprint=?",
               (now, value, peak, reason, fp))
@@ -259,12 +308,18 @@ def band_level(value, th):
     return 0
 
 def eval_band(value, th, sustained, need, rising_fast, cap_notice_first=False, slope=None):
-    """Deterministisch: crit altijd; urgent bij sustain of rising_fast; warning
+    """Deterministisch: crit bij sustain; urgent bij sustain of rising_fast; warning
     bij sustain of rising_fast; allereerste breach-sample -> notice (cap).
-    lvl 2 + snel stijgend + nabij urgent -> urgent (§7)."""
+    lvl 2 + snel stijgend + nabij urgent -> urgent (§7).
+    §7b temperatuur-micro-spikes (2026-09-23): met critical_needs_sustain is één
+    critical-band sample max notice — pas critical bij sustained>=need (de volgende
+    sample moet het bevestigen). Met urgent_sustained_samples escaleert een lang
+    genoeg sustained warn-band alsnog naar urgent (tenminste 10 min boven warn)."""
     lvl = band_level(value, th)
     bits = []
     if lvl == 4:
+        if th.get("critical_needs_sustain") and sustained < need:
+            return 1, True, [f">=critical({th.get('critical_pct')}) single sample -> notice (critical_needs_sustain, §7b)"]
         return 4, False, [f">=critical({th.get('critical_pct')})"]
     if cap_notice_first and sustained < 2 and lvl >= 1:
         return 1, True, [f"eerste breach-sample ({value}) -> notice (cap, §7)"]
@@ -275,6 +330,9 @@ def eval_band(value, th, sustained, need, rising_fast, cap_notice_first=False, s
             return 3, True, [">=urgent + rising_fast"]
         return 2, True, [">=urgent single sample -> warning provisional"]
     if lvl == 2:
+        us = th.get("urgent_sustained_samples")
+        if us and sustained >= int(us):
+            return 3, False, [f">=warn sustained({sustained}) -> urgent (urgent_sustained_samples={us}, §7b)"]
         if sustained >= need:
             return 2, False, [f">=warn sustained({sustained})"]
         if rising_fast:
@@ -329,7 +387,7 @@ def pct_metric(c, cfg, events, *, fp, metric, label, th, sustain_need, value, po
                 if good >= need_resolve:
                     c.execute("update incidents set state='resolved', current_severity='normal',"
                               " previous_severity=?, last_seen=?, last_changed=?, resolved_at=?,"
-                              " good_samples=0, last_reason=? where fingerprint=?",
+                              " good_samples=0, llm_call_count=0, last_reason=? where fingerprint=?",
                               (NAME[prev_sev], now_iso(), now_iso(), now_iso(),
                                f"recovery: {good} goede samples < exit {exit_at}", fp))
                     events.append(emit(mode, label, fp, current=value, trend=trend, severity="normal",
@@ -442,6 +500,48 @@ def run_dumbscope(cfg, c, events, mode="fast"):
     seeded = seeded_row is not None
     changed = 0
 
+    # Centrale incident-routing (fase 9): DUMBscope-incidenten lopen via
+    # incident_upsert -> incidents-tabel -> bestaande notifier-policy. Eerste
+    # run na activering: huidige actieve incidenten stilletjes overnemen
+    # (cursor dumbscope:incidents_seeded) zodat de koppeling geen alertstorm
+    # veroorzaakt; elke latere transitie (new/escalated/reopened/resolved)
+    # volgt gewoon de machine en kan Telegram bereiken.
+    inc_seeded_row = c.execute("select value from cursors where name="
+                               "'dumbscope:incidents_seeded'").fetchone()
+
+    def ds_incident_upsert(inc_, sev_level_, reason_):
+        """DUMBscope-incident -> centrale state-machine. Resolved/seeds zonder
+        openstaand incident zijn stil; verder doet de machine alles."""
+        return incident_upsert(c, inc_["fingerprint"], source="dumbscope",
+                               itype="dumbscope", sev_level=sev_level_,
+                               value=float(inc_["occurrences"] or 0), reason=reason_)
+
+    if not inc_seeded_row:
+        now = now_iso()
+        for inc_ in result["incidents"]:
+            if inc_["state"] != "active":
+                continue
+            c.execute("insert or ignore into incidents(fingerprint, source, type, state,"
+                      " current_severity, previous_severity, first_seen, last_seen,"
+                      " last_changed, occurrences, last_value, peak_value, last_alert_at,"
+                      " last_reason) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (inc_["fingerprint"], "dumbscope", "dumbscope", "active",
+                       inc_["severity"], "normal", now, inc_["last_seen"] or now, now,
+                       inc_["occurrences"] or 1, float(inc_["occurrences"] or 0),
+                       float(inc_["occurrences"] or 0), now,
+                       f"seed: {inc_['title']}"[:200]))
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('dumbscope:incidents_seeded', '1', ?) on conflict(name)"
+                  " do update set value=excluded.value, last_checked=excluded.last_checked",
+                  (now_iso(),))
+        events.append(emit(mode, "dumbscope_baseline", "dumbscope:incidents_seeded",
+                           current={"seeded": sum(1 for i_ in result["incidents"]
+                                                  if i_["state"] == "active")},
+                           severity="normal", provisional=bp, state="seeded",
+                           baseline_pending=bp, source="dumbscope",
+                           reason="actieve DUMBscope-incidenten overgenomen in de centrale"
+                                  " incident-machine (geen notificaties)"))
+
     def emit_ds(inc, ev_state, sev, changed_fields, reason):
         events.append(emit(mode, "dumbscope_incident", inc["fingerprint"],
                            current={"status": inc["source_status"], "occurrences": inc["occurrences"],
@@ -477,6 +577,10 @@ def run_dumbscope(cfg, c, events, mode="fast"):
             if seeded:
                 emit_ds(inc, "resolved" if inc["state"] == "resolved" else "active",
                         inc["severity"], ["new"], "nieuw DUMBscope-incident")
+                if inc["state"] == "active":
+                    # fase 9: via centrale machine -> notifier-policy (warning+ -> pending)
+                    ds_incident_upsert(inc, LEVELS.get(inc["severity"], 1),
+                                       f"nieuw DUMBscope-incident: {inc['title']}"[:200])
                 changed += 1
             continue
         c.execute("update dumbscope_incidents set incident_id=?, status=?, severity=?,"
@@ -509,6 +613,17 @@ def run_dumbscope(cfg, c, events, mode="fast"):
         if inc["severity_unmapped"]:
             reason += f" [onbekende severity '{inc['severity_source']}' -> notice]"
         emit_ds(inc, ev_state, sev, changed_fields, reason)
+        # fase 9: zelfde transitie door de centrale machine; 'resolved' herstelt
+        # (notifier: recovery precies eenmaal), escalaties negeren cooldown,
+        # occurrences-only wijzigingen zijn 'none' (geen duplicate-alerts).
+        if inc["source_status"] == "resolved":
+            ds_incident_upsert(inc, 0, f"DUMBscope hersteld: {inc['title']}"[:200])
+        elif s_status == "resolved":
+            ds_incident_upsert(inc, LEVELS.get(inc["severity"], 1),
+                               f"DUMBscope heropend: {inc['title']}"[:200])
+        else:
+            ds_incident_upsert(inc, LEVELS.get(inc["severity"], 1),
+                               f"{reason}; {inc['title']}"[:200])
         changed += 1
 
     if not seeded:
@@ -523,6 +638,212 @@ def run_dumbscope(cfg, c, events, mode="fast"):
                            source="dumbscope"))
     c.commit()
     st["dumbscope_changed"] = changed
+    return st
+
+
+def _infinidysk_dumb_context():
+    """Begrensde DUMB-context uit samples.db (read-only): rss, rss-groei/u,
+    totale repairs/u en mount-status. Geen logregels. Faalt de DB of tabel ->
+    geen context (best-effort)."""
+    try:
+        s = sqlite3.connect(f"file:{SAMPLES_DB}?mode=ro", uri=True, timeout=3)
+        row = s.execute(
+            "select ts, nzbdav_rss_kb, nzbdav_rss_growth_kbph,"
+            " infinidysk_repairs_1h, mount_ok from dumb_samples"
+            " order by ts desc limit 1").fetchone()
+        s.close()
+        if not row:
+            return {}
+        age = int(time.time() - row[0]) // 60 if row[0] else None
+        return {"dumb": {"rss_kb": row[1], "rss_growth_kbph": row[2],
+                         "repairs_1h_total": row[3], "mount_ok": row[4],
+                         "sample_age_min": age}}
+    except Exception:  # noqa: BLE001 — context is best-effort
+        return {}
+
+
+def run_infinidysk(cfg, c, events, mode="fast", now=None):
+    """Per-bestand repair-loop-detectie (fase 7) — volledig deterministisch,
+    read-only t.o.v. DUMB; schrijft uitsluitend eigen state-tabellen en gebruikt
+    de bestaande incident-state-machine (incident_upsert). Policy
+    (thresholds.yaml: infinidysk): >= warning_count (5) repairs/60min -> warning,
+    >= urgent_count (10) -> urgent, 1-4 met laatste repair binnen
+    resolve_after_minutes (120) -> notice (incident blijft open, geen nieuwe
+    notificaties: geen pending_transition), daarna -> normal (machine resolved).
+    Eerste waarneming (geen cursor) is een seed-run: state wél, maar
+    notificatie-graad gedempt naar notice (zelfde patroon als dumbscope:seed).
+    Gezonde run: 0 events, 0 LLM-kandidaten."""
+    import hermes_infinidysk as hi
+    icfg = dict(cfg.get("infinidysk") or {})
+    bp = bool(icfg.get("baseline_pending", True))
+    warn_n = int(icfg.get("warning_count", 5))
+    urg_n = int(icfg.get("urgent_count", 10))
+    window_min = int(icfg.get("window_minutes", 60))
+    resolve_min = int(icfg.get("resolve_after_minutes", 120))
+    window_s, resolve_s = window_min * 60, resolve_min * 60
+    backlog_s = int(icfg.get("initial_backlog_hours", 24)) * 3600
+    log_path = icfg.get("log_path") or "/opt/dumblog/infinidysk.log"
+    tz_name = icfg.get("log_tz") or "Europe/Amsterdam"
+    now = int(now if now is not None else
+              datetime.now(timezone.utc).timestamp())
+    st = {}
+
+    # --- bron-beschikbaarheid (zelfde anti-flap-patroon als dumbscope) -------
+    fail_row = c.execute("select value from cursors where"
+                         " name='infinidysk:log_fail'").fetchone()
+    fails = int(float(fail_row[0])) if fail_row else 0
+    cur_row = c.execute("select value from cursors where"
+                        " name='infinidysk:log_cursor'").fetchone()
+    try:
+        cursor = json.loads(cur_row[0]) if cur_row else None
+    except Exception:  # noqa: BLE001 — corrupte cursor = opnieuw beginnen
+        cursor = None
+    try:
+        lines, cursor, _note = hi.tail_new_lines(
+            log_path, cursor, now, initial_backlog_s=backlog_s, tz_name=tz_name)
+    except Exception as e:  # noqa: BLE001 — isolatie: bron uit = geen detectie
+        fails += 1
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('infinidysk:log_fail', ?, ?) on conflict(name)"
+                  " do update set value=excluded.value,"
+                  " last_checked=excluded.last_checked", (str(fails), now_iso()))
+        lvl = 3 if fails >= 12 else (2 if fails >= 3 else 0)
+        if lvl:
+            _, etype = incident_upsert(c, "infinidysk:log_unavailable",
+                                       source="infinidysk", itype="availability",
+                                       sev_level=lvl, value=fails,
+                                       reason=f"log onleesbaar ({fails} runs): "
+                                              f"{type(e).__name__}")
+            if etype in ("new", "escalated"):
+                events.append(emit(mode, "infinidysk_availability",
+                                   "infinidysk:log_unavailable", current=fails,
+                                   severity=NAME[lvl], provisional=bp,
+                                   state="active", baseline_pending=bp,
+                                   reason=f"InfiniDysk-log onleesbaar: "
+                                          f"{type(e).__name__} ({fails} runs)",
+                                   source="infinidysk"))
+        c.commit()
+        st["infinidysk"] = f"log_onleesbaar ({fails})"
+        return st
+    if fails:
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('infinidysk:log_fail', '0', ?) on conflict(name)"
+                  " do update set value=excluded.value,"
+                  " last_checked=excluded.last_checked", (now_iso(),))
+        _, etype = incident_upsert(c, "infinidysk:log_unavailable",
+                                   source="infinidysk", itype="availability",
+                                   sev_level=0, value=0,
+                                   reason="log weer leesbaar")
+        if etype == "resolved":
+            events.append(emit(mode, "infinidysk_availability",
+                               "infinidysk:log_unavailable", severity="normal",
+                               provisional=bp, state="resolved",
+                               baseline_pending=True,
+                               reason="log weer leesbaar", source="infinidysk"))
+    c.execute("insert into cursors(name, value, last_checked)"
+              " values('infinidysk:log_cursor', ?, ?) on conflict(name)"
+              " do update set value=excluded.value,"
+              " last_checked=excluded.last_checked", (json.dumps(cursor), now_iso()))
+    seeded_run = cur_row is None
+
+    # --- ingest (PK-dedup: exact dubbele regels tellen niet dubbel) ----------
+    for ln in lines:
+        ev = hi.parse_line(ln, tz_name)
+        if not ev:
+            continue
+        norm = hi.normalize_path(ev["path"])
+        ifp = f"infinidysk:repair_loop:{hi.fingerprint(norm)}"
+        disp = hi.display_name(ev["path"])
+        if ev["kind"] in hi.START_KINDS:
+            c.execute("insert or ignore into infinidysk_repairs"
+                      "(fingerprint, ts, kind, ts_iso) values(?,?,?,?)",
+                      (ifp, ev["ts"], ev["kind"], now_iso()))
+            c.execute("insert into infinidysk_loop(fingerprint, display,"
+                      " last_reason, updated_at) values(?,?,?,?)"
+                      " on conflict(fingerprint) do update set"
+                      " display=excluded.display, updated_at=excluded.updated_at",
+                      (ifp, disp, None, now_iso()))
+        elif ev.get("reason"):
+            c.execute("update infinidysk_loop set last_reason=?, updated_at=?"
+                      " where fingerprint=?",
+                      (ev["reason"][:200], now_iso(), ifp))
+
+    # --- begrensde retentie ---------------------------------------------------
+    c.execute("delete from infinidysk_repairs where ts < ?",
+              (now - (resolve_s + 3600),))
+    c.execute("delete from infinidysk_repairs where rowid not in"
+              " (select rowid from infinidysk_repairs order by ts desc limit 20000)")
+    stale_cutoff = datetime.fromtimestamp(now - 7 * 86400,
+                                          timezone.utc).isoformat(timespec="seconds")
+    c.execute("delete from infinidysk_loop where updated_at < ?"
+              " and fingerprint not in"
+              " (select fingerprint from infinidysk_repairs)", (stale_cutoff,))
+
+    # --- policy per bestand -> bestaande state-machine ------------------------
+    fps = [r[0] for r in c.execute(
+        "select fingerprint from infinidysk_loop order by updated_at desc"
+        " limit 500")]
+    emitted = 0
+    total60 = 0
+    for ifp in fps:
+        ts_list = [r[0] for r in c.execute(
+            "select ts from infinidysk_repairs where fingerprint=? order by ts",
+            (ifp,))]
+        n60 = len([t for t in ts_list if t >= now - window_s])
+        total60 += n60
+        last = max(ts_list) if ts_list else 0
+        disp, last_reason = c.execute(
+            "select display, last_reason from infinidysk_loop where"
+            " fingerprint=?", (ifp,)).fetchone()
+        age_min = round((now - last) / 60) if last else None
+        if n60 >= urg_n:
+            lvl = 3
+            reason = f"{n60} repairs/{window_min}min (>= {urg_n}): {disp}"
+        elif n60 >= warn_n:
+            lvl = 2
+            reason = f"{n60} repairs/{window_min}min (>= {warn_n}): {disp}"
+        elif last and (now - last) < resolve_s:
+            lvl = 1
+            reason = (f"{n60} repairs/{window_min}min; laatste repair "
+                      f"{age_min} min geleden: {disp}")
+        else:
+            lvl = 0
+            reason = (f"geen repairs meer (laatste {age_min} min geleden): "
+                      f"{disp}")
+        istate_row = c.execute("select state from incidents where"
+                               " fingerprint=?", (ifp,)).fetchone()
+        istate = istate_row[0] if istate_row else None
+        if lvl == 0 and istate in (None, "resolved"):
+            continue  # niets open, niets nieuws: geen run-activiteit
+        if seeded_run and lvl >= 2:
+            lvl = 1
+            reason = f"baseline-seed (gedempt): {reason}"
+        _, etype = incident_upsert(c, ifp, source="infinidysk",
+                                   itype="repair_loop", sev_level=lvl,
+                                   value=n60, reason=reason[:200])
+        if etype in ("new", "escalated", "reopened", "resolved"):
+            emitted += 1
+            events.append(emit(mode, "infinidysk_repair_loop", ifp,
+                               current={"repairs_60m": n60,
+                                        "last_repair_age_min": age_min},
+                               severity=NAME[lvl] if lvl else "normal",
+                               provisional=bp,
+                               state=("resolved" if etype == "resolved"
+                                      else "active"),
+                               baseline_pending=bp, reason=reason[:240],
+                               source="infinidysk",
+                               extra={"file": disp,
+                                      "last_reason": (last_reason or "")[:160],
+                                      "thresholds": {
+                                          "warning": warn_n, "urgent": urg_n,
+                                          "window_min": window_min,
+                                          "resolve_min": resolve_min},
+                                      **_infinidysk_dumb_context()}))
+    st["infinidysk"] = "ok"
+    st["infinidysk_loops_tracked"] = len(fps)
+    st["infinidysk_total_60m"] = total60
+    st["infinidysk_events"] = emitted
+    c.commit()  # zelfstandig (zelfde patroon als run_dumbscope); idempotent in run_fast
     return st
 
 # -------------------------------------------------------------------- fast --
@@ -544,6 +865,14 @@ def needs_llm_analysis(c, fp, severity, state):
         if d and d[0] and d[1] and d[1] != "[]" and (d[2] in (None, "[]", "")):
             return False, "skip:duidelijke_root_cause_met_evidence"
         return True, "route:dumbscope_onzeker_of_multi_system_of_hostcorrelatie"
+    if fp.startswith("infinidysk:repair_loop:"):
+        d = c.execute("select last_reason from infinidysk_loop where"
+                      " fingerprint=?", (fp,)).fetchone()
+        if d and d[0] and re.search(
+                r"430|no such article|not found|missing articles|"
+                r"missing/corrupt segment|dmca|expired", d[0], re.I):
+            return False, "skip:bekende_deterministische_oorzaak(dode_artikelen)"
+        return True, "route:repair_loop_oorzaak_onzeker"
     for pref in ("host:cache:high", "host:vm_storage:high", "host:user_share:high",
                  "host:rootfs:high", "host:logfs:high", "host:logfs:growth",
                  "host:docker_vdisk:high", "host:docker_vdisk:growth",
@@ -582,6 +911,23 @@ def build_context(c, fp, sev):
         " and fingerprint != ? and current_severity in ('warning','urgent','critical')", (fp,))]
     if others:
         ctx["concurrent_incidents"] = others[:8]
+    # fase 4: change-correlation + recurrentie — deterministisch, lokaal, gratis.
+    # Alleen bereikt als dit incident al een LLM-candidate is; gezonde runs
+    # komen hier nooit (geen extra LLM-calls, §6). Hash bevat deze velden niet:
+    # correlation rijdt mee met bestaande analyses, veroorzaakt er geen.
+    try:
+        import hermes_changes as hc
+        ccfg = hc.load_cfg()
+        exclude_key = fp.split(":")[1] if fp.startswith("docker:") and \
+            (":restarts" in fp or ":exited" in fp) else None
+        ch = hc.correlate(c, now_iso(), exclude_key=exclude_key, cfg=ccfg)
+        if ch:
+            ctx["recent_changes"] = ch
+        rec = hc.recurrence(c, fp, label=fp, cfg=ccfg)
+        if rec:
+            ctx["recurrence"] = rec
+    except Exception:  # noqa: BLE001 — context is best-effort, nooit kritiek
+        pass
     try:
         import hermes_prometheus as hprom
         trends = hprom.llm_trend_lines(c, fp)
@@ -599,6 +945,22 @@ def build_context(c, fp, sev):
                     "occurrences": d[6],
                     "evidence": (json.loads(d[7]) if d[7] else [])[:10],
                     "host_correlations": json.loads(d[8]) if d[8] else []})
+    if fp.startswith("infinidysk:repair_loop:"):
+        lo = c.execute("select display, last_reason from infinidysk_loop"
+                       " where fingerprint=?", (fp,)).fetchone()
+        if lo:
+            ctx.update({"file": (lo[0] or "")[:120],
+                        "last_failure_reason": (lo[1] or "")[:160]})
+        try:
+            n60 = c.execute("select count(*) from infinidysk_repairs where"
+                            " fingerprint=? and ts >= ?",
+                            (fp, int(time.time()) - 3600)).fetchone()[0]
+            ctx["repairs_60m"] = n60
+        except Exception:  # noqa: BLE001 — context is best-effort
+            pass
+        dctx = _infinidysk_dumb_context()
+        if dctx:
+            ctx.update(dctx)
     return ctx
 
 def run_llm_layer(cfg, c, events):
@@ -671,6 +1033,318 @@ def run_llm_layer(cfg, c, events):
                                           "summary": summary}}))
     return stats
 
+# ----------------------------------------------------------------- netdata --
+# fase 8: Netdata-alarmspiegel. Client/allowlist/normalisatie staan in
+# hermes_netdata.py (read-only, uitsluitend GET /api/v1/alarms). Hermes blijft
+# leidend: metrics met eigen drempels (memory, temperaturen, disk-space) zijn
+# evidence-only en een netdata-critical telt daar alleen als de laatste
+# hermes-sample het bevestigt; uncovered onderwerpen (cpu/iowait, load,
+# per-container health, net-drops, swap, oom-space-time) gaan via de gewone
+# incident-machine -> bestaande notifier-policy (dedup/cooldown/recovery).
+NETDATA_SEV_ORDER = {"warning": 2, "critical": 4}
+
+
+def _netdata_container_covered(c, subject):
+    """True als een bestaande hermes-bron deze container al dekt: een actief
+    DUMBscope-incident over deze container of een actief unhealthy-incident.
+    Dan is netdata evidence, geen nieuw alarm (geen dubbele Telegram-alerts)."""
+    like = f"%{subject.lower()}%"
+    row = c.execute(
+        "select 1 from dumbscope_incidents where status='active' and ("
+        "lower(title) like ? or lower(coalesce(root_cause_service,'')) like ?"
+        " or lower(coalesce(affected_services,'')) like ?"
+        " or lower(substr(fingerprint, 11)) like ?) limit 1",
+        (like, like, like, like)).fetchone()
+    if row:
+        return True
+    row = c.execute("select 1 from incidents where fingerprint="
+                    "'host:containers:unhealthy' and state in ('active','recovering')").fetchone()
+    return row is not None
+
+
+def _netdata_confirm_sample(metric, confirm_thr):
+    """Laatste hermes-sample (1u-venster) voor direction-confirm van een
+    netdata-critical; None = geen bevestigende sample."""
+    pts = fetch_series(metric, 1)
+    if not pts:
+        return None
+    val = pts[-1][1]
+    return val if val >= confirm_thr else None
+
+
+def _netdata_alert(c, events, cfg, n, *, mode, bp, situation):
+    """Correlatie/dedup van één netdata-alarmovergang (nieuw of escalatie).
+    Retourneert 'alerted' | 'confirmed' | 'evidence' | 'dedup'."""
+    import hermes_netdata as hn
+    sev_level = LEVELS[n["severity"]]
+    extra = {"netdata": {"name": n["name"], "chart": n["chart"], "kind": n["kind"],
+                         "subject": n["subject"], "value": n["value"],
+                         "last_status_change": n["last_status_change"]}}
+    reason = (f"netdata {n['name']} {n['severity']} ({n['value']}"
+              f"{'; ' + situation if situation else ''})")[:240]
+
+    if n["kind"] == "container" and _netdata_container_covered(c, n["subject"]):
+        extra["dedup"] = "covered_evidence_only"
+        events.append(emit(mode, "netdata_alarm", n["fingerprint"], current=n["value"],
+                           severity=n["severity"], provisional=bp, state="observed",
+                           baseline_pending=bp, source="netdata", extra=extra,
+                           reason=reason + " -> al gedekt door actief dumbscope/unhealthy-incident"
+                                             " (evidence-only)"))
+        return "evidence"
+
+    cov = hn.covered_check(cfg, n)
+    if cov:
+        hermes_fp, metric, confirm_thr = cov
+        if n["severity"] != "critical":
+            extra["dedup"] = "covered_evidence_only"
+            events.append(emit(mode, "netdata_alarm", n["fingerprint"], current=n["value"],
+                               severity=n["severity"], provisional=bp, state="observed",
+                               baseline_pending=bp, source="netdata", extra=extra,
+                               reason=reason + " -> hermes-check is leidend voor dit subject"
+                                                 " (covered: evidence-only)"))
+            return "evidence"
+        sample = _netdata_confirm_sample(metric, confirm_thr)
+        if sample is None:
+            extra["dedup"] = "covered_evidence_only"
+            events.append(emit(mode, "netdata_alarm", n["fingerprint"], current=n["value"],
+                               severity=n["severity"], provisional=bp, state="observed",
+                               baseline_pending=bp, source="netdata", extra=extra,
+                               reason=reason + f" -> niet bevestigd door hermes-sample"
+                                                 f" {metric} (>= {confirm_thr:g} vereist);"
+                                                 f" evidence-only"))
+            return "evidence"
+        _, etype = incident_upsert(c, hermes_fp, source="netdata", itype="netdata_confirm",
+                                   sev_level=sev_level, value=n["value"],
+                                   reason=f"{reason}; bevestigd door hermes-sample"
+                                          f" {metric}={sample:g} (>= {confirm_thr:g})")
+        if etype in ("new", "escalated", "reopened"):
+            extra["dedup"] = "covered_confirmed_critical"
+            events.append(emit(mode, "netdata_alarm", hermes_fp, current=n["value"],
+                               severity=n["severity"], provisional=bp, state="active",
+                               baseline_pending=bp, source="netdata", extra=extra,
+                               reason=reason + f"; bevestigd door hermes-sample {metric}={sample:g}"))
+            return "confirmed"
+        return "dedup"
+
+    # uncovered: netdata is de enige sensor voor dit onderwerp -> gewoon
+    # incident; notifier-policy bepaalt verzending (warning+ => pending).
+    _, etype = incident_upsert(c, n["fingerprint"], source="netdata",
+                               itype=f"netdata_{n['kind']}", sev_level=sev_level,
+                               value=n["value"], reason=reason)
+    if etype in ("new", "escalated", "reopened"):
+        events.append(emit(mode, "netdata_alarm", n["fingerprint"], current=n["value"],
+                           severity=n["severity"], provisional=bp, state="active",
+                           baseline_pending=bp, source="netdata", extra=extra,
+                           reason=reason))
+        return "alerted" if etype != "escalated" else "confirmed"
+    return "dedup"
+
+
+def run_netdata(cfg, c, events, mode="fast"):
+    """fase 8 — Netdata-alarmspiegel (read-only). Eerste geslaagde poll = seed
+    (state vastleggen, geen events, geen alarmstorm bij eerste deployment).
+    Daarna diffen: nieuw/escalatie -> _netdata_alert; verdwenen na geslaagde
+    poll -> recovery via de incident-machine. Mislukte polls raken de
+    alarm-state NIET (geen valse recoveries); >=N mislukkingen -> availability-
+    incident (waarschuwingsdrempels uit thresholds.yaml)."""
+    import hermes_netdata as hn
+    ncfg = dict(cfg.get("netdata") or {})
+    bp = bool(ncfg.get("baseline_pending", True))
+    fail_warn = int(ncfg.get("failure_warning_polls", 3))
+    fail_urgent = int(ncfg.get("failure_urgent_polls", 12))
+    st = {"alarms_active": 0, "new_alerts": 0, "escalated": 0, "recovered": 0,
+          "evidence_only": 0, "unavailable_polls": 0}
+
+    def failures():
+        row = c.execute("select value from cursors where name='netdata:failures'").fetchone()
+        return int(float(row[0])) if row else 0
+
+    def set_failures(n_):
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('netdata:failures', ?, ?)"
+                  " on conflict(name) do update set value=excluded.value,"
+                  " last_checked=excluded.last_checked", (str(n_), now_iso()))
+
+    try:
+        client = hn.make_client(cfg)
+        raws = client.active_alarms()
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed (dumbscope-patroon)
+        reason = getattr(e, "reason", type(e).__name__)
+        n_ = failures() + 1
+        set_failures(n_)
+        st["unavailable_polls"] = n_
+        lvl = 3 if n_ >= fail_urgent else (2 if n_ >= fail_warn else 0)
+        if lvl:
+            _, etype = incident_upsert(c, "netdata:availability", source="netdata",
+                                       itype="availability", sev_level=lvl, value=n_,
+                                       reason=f"{n_} opeenvolgende mislukte polls ({reason})")
+            if etype in ("new", "escalated"):
+                events.append(emit(mode, "netdata_availability", "netdata:availability",
+                                   current=n_, severity=NAME[lvl], provisional=bp,
+                                   state="active", baseline_pending=bp, source="netdata",
+                                   reason=f"Netdata onbereikbaar: {reason} ({n_} polls)"))
+        c.commit()
+        return st
+
+    n_ = failures()
+    if n_:
+        set_failures(0)
+        st["unavailable_polls"] = 0
+        _, etype = incident_upsert(c, "netdata:availability", source="netdata",
+                                   itype="availability", sev_level=0, value=0,
+                                   reason="Netdata weer bereikbaar")
+        if etype == "resolved":
+            events.append(emit(mode, "netdata_availability", "netdata:availability",
+                               severity="normal", provisional=bp, state="resolved",
+                               baseline_pending=True, source="netdata",
+                               reason=f"hersteld na {n_} mislukte polls"))
+    c.execute("insert into cursors(name, value, last_checked)"
+              " values('netdata:last_poll', ?, ?)"
+              " on conflict(name) do update set value=excluded.value,"
+              " last_checked=excluded.last_checked", (now_iso(), now_iso()))
+
+    alarms = {}
+    for raw in raws:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("disabled") or raw.get("silenced"):
+            continue
+        n = hn.normalize(raw)
+        if n:
+            alarms[n["fingerprint"]] = n
+    st["alarms_active"] = len(alarms)
+
+    seeded_row = c.execute("select value from cursors where name='netdata:seeded'").fetchone()
+    if not seeded_row:
+        for fp, n in sorted(alarms.items()):
+            c.execute("insert or replace into netdata_alarms(fingerprint, name, chart,"
+                      " kind, subject, last_status, last_severity, last_value,"
+                      " alert_state, first_seen, last_seen, last_reason)"
+                      " values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (fp, n["name"], n["chart"], n["kind"], n["subject"],
+                       n["severity"].upper(), n["severity"], n["value"], "seeded",
+                       now_iso(), now_iso(), "seed: bestaand alarm bij eerste poll"))
+        c.execute("insert into cursors(name, value, last_checked)"
+                  " values('netdata:seeded', '1', ?)"
+                  " on conflict(name) do update set value=excluded.value,"
+                  " last_checked=excluded.last_checked", (now_iso(),))
+        events.append(emit(mode, "netdata_baseline", "netdata:baseline",
+                           current={"seeded": len(alarms)}, severity="normal",
+                           provisional=bp, state="seeded", baseline_pending=bp,
+                           source="netdata",
+                           reason=f"eerste poll: {len(alarms)} actieve netdata-alarms geseed"
+                                  f" (geen per-alarm events)"))
+        c.commit()
+        return st
+
+    for fp, n in sorted(alarms.items()):
+        row = c.execute("select last_severity from netdata_alarms where fingerprint=?",
+                        (fp,)).fetchone()
+        prev_sev = row[0] if row else None
+        c.execute("insert into netdata_alarms(fingerprint, name, chart, kind, subject,"
+                  " last_status, last_severity, last_value, alert_state, first_seen,"
+                  " last_seen, last_reason) values(?,?,?,?,?,?,?,?,?,?,?,?)"
+                  " on conflict(fingerprint) do update set name=excluded.name,"
+                  " chart=excluded.chart, kind=excluded.kind, subject=excluded.subject,"
+                  " last_status=excluded.last_status, last_severity=excluded.last_severity,"
+                  " last_value=excluded.last_value, last_seen=excluded.last_seen,"
+                  " alert_state='active'",
+                  (fp, n["name"], n["chart"], n["kind"], n["subject"],
+                   n["severity"].upper(), n["severity"], n["value"], "active",
+                   now_iso(), now_iso(), f"netdata {n['severity']} actief"))
+        if row is None:
+            r = _netdata_alert(c, events, cfg, n, mode=mode, bp=bp,
+                               situation="nieuw sinds seed")
+            if r == "alerted":
+                st["new_alerts"] += 1
+            elif r == "evidence":
+                st["evidence_only"] += 1
+        elif prev_sev != n["severity"] and \
+                NETDATA_SEV_ORDER.get(n["severity"], 0) > NETDATA_SEV_ORDER.get(prev_sev, 0):
+            r = _netdata_alert(c, events, cfg, n, mode=mode, bp=bp,
+                               situation=f"escalatie {prev_sev}->{n['severity']}")
+            if r == "confirmed":
+                st["escalated"] += 1
+            elif r == "evidence":
+                st["evidence_only"] += 1
+        # de-escalatie binnen de active-set of identiek alarm: alleen state,
+        # geen event (duplicaat-demping; herstel is verdwijnen uit de set)
+
+    for (fp,) in c.execute("select fingerprint from netdata_alarms"
+                           " where alert_state='active'").fetchall():
+        if fp in alarms:
+            continue
+        c.execute("update netdata_alarms set alert_state='resolved', resolved_at=?,"
+                  " last_reason=? where fingerprint=?",
+                  (now_iso(), "alarm verdwenen uit netdata active-set (herstel of verwijderd)", fp))
+        irow = c.execute("select state from incidents where fingerprint=?", (fp,)).fetchone()
+        if irow and irow[0] in ("active", "recovering"):
+            _, etype = incident_upsert(c, fp, source="netdata", itype="netdata_recovery",
+                                       sev_level=0, value=0,
+                                       reason="netdata-alarm hersteld: verdwenen uit active-set")
+            if etype == "resolved":
+                events.append(emit(mode, "netdata_alarm", fp, severity="normal",
+                                   provisional=bp, state="resolved", baseline_pending=True,
+                                   source="netdata",
+                                   reason="netdata-alarm hersteld: verdwenen uit active-set"))
+                st["recovered"] += 1
+    c.commit()
+    return st
+
+
+# ------------------------------------------------------------ sampler-gap --
+def run_sampler_gap(cfg, c, events, mode="fast"):
+    """fase 9 — detecteer stilgevallen van de host-sampler aan de hand van de
+    laatste sample-ts in samples.db. >10 min geen sample -> warning,
+    >30 min -> urgent (escalatie), herstel zodra sampling weer actueel is
+    (recovery precies eenmaal via de centrale machine/notifier). Een
+    lees-fout op samples.db is geen signaal: state onaangeroerd, NOOIT een
+    valse recovery. Herhaalde polls op dezelfde stale-hoogte zijn 'none'
+    (geen reminder-spam); alleen nieuw/escalatie/recovery leveren events."""
+    try:
+        s = sqlite3.connect(f"file:{SAMPLES_DB}?mode=ro", uri=True, timeout=5)
+        row = s.execute("select max(ts) from samples").fetchone()
+        s.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    age_min = (time.time() - float(row[0])) / 60.0
+    lvl = 3 if age_min > 30 else (2 if age_min > 10 else 0)
+    fp = "hermes:sampler:stale"
+    if lvl:
+        _, etype = incident_upsert(c, fp, source="fast", itype="sampler_stale",
+                                   sev_level=lvl, value=round(age_min, 1),
+                                   reason=f"laatste host-sample {int(age_min)} min geleden"
+                                          f" (drempel 10/30 min)")
+        if etype in ("new", "escalated", "reopened"):
+            events.append(emit(mode, "sampler_gap", fp, current=round(age_min, 1),
+                               severity=NAME[lvl], provisional=True, state="active",
+                               baseline_pending=True,
+                               reason=f"host-sampler stale: laatste sample {int(age_min)}"
+                                      f" min geleden (drempel 10/30 min)",
+                               recommended_diagnostic="hermes-host-sampler log/cron"))
+            return {"age_min": round(age_min, 1), "level": NAME[lvl], "event": etype}
+        return {"age_min": round(age_min, 1), "level": NAME[lvl], "event": "none"}
+    # actueel: eventueel openstaand stale-incident laten herstellen
+    irow = c.execute("select peak_value from incidents where fingerprint=?"
+                     " and state in ('active','recovering')", (fp,)).fetchone()
+    if irow is None:
+        return {"age_min": round(age_min, 1), "level": "normal", "event": "none"}
+    peak = irow[0]
+    _, etype = incident_upsert(c, fp, source="fast", itype="sampler_stale",
+                               sev_level=0, value=round(age_min, 1),
+                               reason=f"hersteld: sampling weer actueel (was {int(peak or 0)}"
+                                      f" min stale)")
+    if etype == "resolved":
+        events.append(emit(mode, "sampler_gap", fp, severity="normal", provisional=True,
+                           state="resolved", baseline_pending=True,
+                           reason=f"hersteld: sampler weer actueel na piek van"
+                                  f" {int(peak or 0)} min stale"))
+        return {"age_min": round(age_min, 1), "level": "normal", "event": "resolved"}
+    return {"age_min": round(age_min, 1), "level": "normal", "event": "none"}
+
+
 PCT_RULES_FAST = [
     ("mem_used_pct", "host:memory:high", "memory", "memory", 0.5),
     ("vdisk_pct", "host:docker_vdisk:high", "docker_vdisk", "docker_vdisk", 0.3),
@@ -711,8 +1385,10 @@ def run_fast(cfg, events):
                 th["urgent_pct"] = th.get("package_urgent_c")
                 th["critical_pct"] = th.get("package_critical_c")
                 sneed = max(1, math.ceil(int(th.get("sustained_minutes", 15)) / 5))
-            rising_fast = ((tr.get("slope_per_h") or 0) >=
-                           float(th.get("rise_rate_pct_per_hour", th.get("rise_urgent_ppc_per_hour", 5))))
+                rising_fast = False  # §7b: micro-spike-beleid — geen rate-escalatie; sustain doet het werk
+            else:
+                rising_fast = ((tr.get("slope_per_h") or 0) >=
+                               float(th.get("rise_rate_pct_per_hour", th.get("rise_urgent_ppc_per_hour", 5))))
             sev, prov = pct_metric(c, cfg, events, fp=fp, metric=metric, label=label, th=th,
                                    sustain_need=sneed, value=tr["current"], points=pts, trend=tr,
                                    rising_fast=rising_fast,
@@ -720,29 +1396,34 @@ def run_fast(cfg, events):
                                    eps=eps, mode="fast", sample_ts=ts)
             st[label] = sev
 
-    # vDisk-groei: delta 1h/24h op vdisk_used_kb (alleen laatste stand)
+    # vDisk-groei: per-uur groeirate uit vdisk_used_kb. Grens is per UUR
+    # (growth_warn_gb_per_hour): d1h wordt nooit meer geëxtrapoleerd naar 24u —
+    # dat veroorzaakte false warnings bij gewone groei.
     kb = series["vdisk_used_kb"]
     if len(kb) >= 2:
         tr = trend_of(kb, eps=200 * 1024)
-        limit = float(cfg.get("docker_vdisk", {}).get("growth_warn_gb_per_24h", 2)) * 1024**2
-        d1h, d24h = tr.get("d1h"), tr.get("d24h")
-        eff = max(x or 0 for x in (d1h * 24 if d1h is not None else 0, d24h or 0))
+        limit = float(cfg.get("docker_vdisk", {}).get("growth_warn_gb_per_hour", 2)) * 1024**2
+        d1h, d6h = tr.get("d1h"), tr.get("d6h")
+        rates = [x for x in (d1h, (d6h / 6) if d6h is not None else None) if x is not None]
+        eff = max(rates) if rates else 0.0  # KB per uur
         lvl = 2 if eff > limit else 0
         _, etype = incident_upsert(c, "host:docker_vdisk:growth", source="fast", itype="vdisk_growth",
                                    sev_level=lvl, value=round(eff / 1024**2, 2),
-                                   reason=f"d1h={d1h}KB d24h={d24h}KB limit={int(limit)}KB",
+                                   reason=(f"groeirate {eff / 1024**2:.2f} GiB/u"
+                                           f" (d1h={d1h}KB d6h={d6h}KB)"
+                                           f" limit={limit / 1024**2:.1f} GiB/u"),
                                    )
-        if etype in ("new", "escalated"):
+        if etype in ("new", "escalated", "reopened"):
             events.append(emit("fast", "docker_vdisk_growth", "host:docker_vdisk:growth",
-                               current=round(eff / 1024**2, 2), trend={"d1h_kb": d1h, "d24h_kb": d24h},
+                               current=round(eff / 1024**2, 2), trend={"d1h_kb": d1h, "d6h_kb": d6h},
                                severity=NAME[lvl], provisional=True, state="active", baseline_pending=True,
-                               reason="groei > growth_warn_gb_per_24h (24u of geëxtrapoleerd uit 1u)",
+                               reason=f"groeirate {eff / 1024**2:.2f} GiB/u >= {limit / 1024**2:.1f} GiB/u",
                                recommended_diagnostic="docker-space-detail"))
         elif etype == "resolved":
             events.append(emit("fast", "docker_vdisk_growth", "host:docker_vdisk:growth",
                                current=round(eff / 1024**2, 2), severity="normal", provisional=True,
                                state="resolved", baseline_pending=True, reason="groei terug onder grens"))
-        metric_state_update(c, "vdisk_growth_kb24", round(eff / 1024**2, 2), tr)
+        metric_state_update(c, "vdisk_growth_gib_per_h", round(eff / 1024**2, 2), tr)
 
     # /var/log-groei: klein tmpfs, snelle groei weegt extra zwaar (§9)
     # eff_rate = max(OLS-slope, 15-min-delta x 4): stapsgroei wordt niet weggedrukt
@@ -780,31 +1461,61 @@ def run_fast(cfg, events):
                   (prev, cur, delta, now_iso()))
         if delta > 0:
             sev_name = cfg.get("memory", {}).get("oom_event_severity", "critical")
+            corr = c.execute("select current_severity from incidents"
+                             " where fingerprint='host:memory:high'"
+                             " and state in ('active','recovering')").fetchone()
+            reason = f"oom_kills {int(prev)} -> {int(cur)}"
+            if corr:
+                reason += f"; correlatie: host:memory:high actief ({corr[0]})"
             _, etype = incident_upsert(c, "host:memory:oom", source="fast", itype="oom",
                                        sev_level=LEVELS[sev_name], value=delta,
-                                       reason=f"oom_kills {int(prev)} -> {int(cur)}", )
-            if etype in ("new", "escalated"):
+                                       reason=reason, )
+            if etype in ("new", "escalated", "reopened"):
                 events.append(emit("fast", "oom", "host:memory:oom", current=int(cur), previous=int(prev),
                                    severity=sev_name, provisional=True, state="active",
-                                   baseline_pending=True, reason=f"OOM-teller +{delta}",
+                                   baseline_pending=True,
+                                   reason=(f"OOM-teller +{delta}" +
+                                           (f" (correlatie: host:memory:high actief)" if corr else "")),
                                    recommended_diagnostic="oom-events"))
+        else:
+            # counter ongewijzigd (of reset na reboot): event-incident Lost direct op;
+            # eenzelfde counterwaarde mag nooit reminders genereren.
+            _, etype = incident_upsert(c, "host:memory:oom", source="fast", itype="oom",
+                                       sev_level=0, value=cur,
+                                       reason="geen nieuwe OOM-delta (counter ongewijzigd)", )
+            if etype == "resolved":
+                events.append(emit("fast", "oom", "host:memory:oom", current=int(cur),
+                                   severity="normal", provisional=True, state="resolved",
+                                   baseline_pending=True,
+                                   reason="OOM-counter ongewijzigd -> event afgesloten"))
         st["oom_kills"] = int(cur)
 
-    # docker daemon down (sampler), swap, unhealthy-teller: laatste sample
+    # docker daemon down (sampler), swap, unhealthy-teller: laatste sample.
+    # Herstel-pad (analoog OOM/counters): een gezonde waarde sluit een nog
+    # openstaand state-incident; zonder row gebeurt er niets.
     for metric, fp, label, lvl0, reason in (
             ("docker_ok", "host:docker_daemon:down", "docker_daemon", 4, "docker daemon onbereikbaar"),
             ("containers_unhealthy", "host:containers:unhealthy", "containers_unhealthy", 1,
              "unhealthy containers aanwezig")):
         pts = fetch_series(metric, 1)
-        if pts and pts[-1][1] == (0 if metric == "docker_ok" else pts[-1][1]) and \
-           ((metric == "docker_ok" and pts[-1][1] == 0) or (metric != "docker_ok" and pts[-1][1] > 0)):
-            value = pts[-1][1]
+        if not pts:
+            continue
+        value = pts[-1][1]
+        problem = (value == 0) if metric == "docker_ok" else (value > 0)
+        if problem:
             _, etype = incident_upsert(c, fp, source="fast", itype=metric, sev_level=lvl0,
                                        value=value, reason=reason, )
             if etype in ("new", "escalated"):
                 events.append(emit("fast", label, fp, current=value, severity=NAME[lvl0],
                                    provisional=True, state="active", baseline_pending=True,
                                    reason=reason, source="fast"))
+        else:
+            _, etype = incident_upsert(c, fp, source="fast", itype=metric, sev_level=0,
+                                       value=value, reason="waarde terug op normaal")
+            if etype == "resolved":
+                events.append(emit("fast", label, fp, current=value, severity="normal",
+                                   provisional=True, state="resolved", baseline_pending=True,
+                                   reason="hersteld: waarde terug op normaal", source="fast"))
     sw = fetch_series("swap_used_kb", 1)
     if sw and sw[-1][1] > 0:
         lvl = 2 if sw[-1][1] > int(cfg.get("swap", {}).get("used_kb_warn", 262144)) else 1
@@ -815,11 +1526,30 @@ def run_fast(cfg, events):
             events.append(emit("fast", "swap", "host:swap:active", current=sw[-1][1],
                                severity=NAME[lvl], provisional=True, state="active",
                                baseline_pending=True, reason="swap verscheen onverwacht"))
+    elif sw:
+        _, etype = incident_upsert(c, "host:swap:active", source="fast", itype="swap",
+                                   sev_level=0, value=sw[-1][1], reason="swap weer 0")
+        if etype == "resolved":
+            events.append(emit("fast", "swap", "host:swap:active", current=sw[-1][1],
+                               severity="normal", provisional=True, state="resolved",
+                               baseline_pending=True, reason="swap terug op 0"))
 
     if new_ts:
         c.execute("insert into cursors(name, value, last_checked) values('fast:last_ts', ?, ?)"
                   " on conflict(name) do update set value=excluded.value, last_checked=excluded.last_checked",
                   (str(int(new_ts[-1])), now_iso()))
+    # fase 4: deploy-events (changes-deploy.jsonl) in de change-ledger lezen.
+    # Kosten zonder deploys: één stat()-call; failure-isolated.
+    try:
+        import hermes_changes as hc
+        if (cfg.get("correlation") or {}).get("enabled", True):
+            hc.collect_deploy_events(c, home=HOME)
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+        events.append(emit("fast", "changes_ledger", "changes:ingest_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"deploy-event ingest faalde (onaangetast): "
+                                  f"{type(e).__name__}: {e}"[:240], source="fast"))
     # DUMBscope-poll (fase 4): failure-isolated — een fout hier raakt de
     # host-evaluatie niet (§21); nog vóór de slot-commit van run_fast.
     try:
@@ -832,6 +1562,20 @@ def run_fast(cfg, events):
                            reason=f"integratiefout (host-monitoring onaangetast): {type(e).__name__}: {e}"[:240],
                            source="dumbscope"))
         st["dumbscope"] = "integration_error"
+    # Per-bestand repair-loop-detectie (fase 7): deterministisch, read-only,
+    # eigen state; faalt dit, dan raakt het de host-evaluatie niet (§21-analoog).
+    try:
+        inf = run_infinidysk(cfg, c, events, mode="fast")
+        st.update({k: v for k, v in inf.items()})
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+        events.append(emit("fast", "infinidysk_integration",
+                           "infinidysk:integration_error", severity="notice",
+                           provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"integratiefout (host-monitoring onaangetast): "
+                                  f"{type(e).__name__}: {e}"[:240],
+                           source="infinidysk"))
+        st["infinidysk"] = "integration_error"
     try:
         llm_stats = run_llm_layer(cfg, c, events)
         st.update({f"llm_{k}": v for k, v in llm_stats.items()})
@@ -857,6 +1601,30 @@ def run_fast(cfg, events):
                            reason=f"prometheus-context faalde (host-monitoring onaangetast): "
                                   f"{type(e).__name__}: {e}"[:240], source="prometheus"))
         st["prometheus"] = "integration_error"
+    # Sampler-gap (fase 9): stilgevallen van de host-sampler -> centraal
+    # incident (hermes:sampler:stale). Failure-isolated: leesfout = geen
+    # signaal, geen valse recovery.
+    try:
+        st["sampler_gap"] = run_sampler_gap(cfg, c, events, mode="fast")
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+        events.append(emit("fast", "sampler_gap_integration", "sampler:integration_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True,
+                           reason=f"sampler-gap-check faalde: {type(e).__name__}: {e}"[:240]))
+        st["sampler_gap"] = "integration_error"
+    # Netdata-alarmspiegel (fase 8): read-only input, allowlist, dedup met
+    # bestaande hermes-checks (die blijven leidend). Failure-isolated: een
+    # netdata-storing raakt host-/dumbscope-monitoring niet (§21-analoog).
+    try:
+        if (cfg.get("netdata") or {}).get("enabled", True):
+            st["netdata"] = run_netdata(cfg, c, events, mode="fast")
+    except Exception as e:  # noqa: BLE001 — isolatie bewust breed
+        events.append(emit("fast", "netdata_integration", "netdata:integration_error",
+                           severity="notice", provisional=True, state="observed",
+                           baseline_pending=True, source="netdata",
+                           reason=f"netdata-input faalde (rest onaangetast):"
+                                  f" {type(e).__name__}: {e}"[:240]))
+        st["netdata"] = "integration_error"
     active = c.execute("select count(*) from incidents where state in ('active','recovering')").fetchone()[0]
     c.commit(); c.close()
     return {"mode": "fast", "run_id": RUN_ID, "ts": now_iso(), "events": len(events),
@@ -934,21 +1702,80 @@ def run_deep(cfg, events):
                                            current=v, previous=prev, severity="warning",
                                            provisional=True, state="active", baseline_pending=True,
                                            reason="pending > 0 (absolute regel, §12)", source="deep"))
-                if delta > 0:
+                # monotone counters: event-beslissing op high-water-mark (§12).
+                # Een dip is een lees-artifact/geen reset-bewijs; alleen een
+                # waarde BOVEN het historisch maximum is een echt event.
+                hwname = f"smart:{dev}:{short}:hw"
+                hwrow = c.execute("select value from cursors where name=?", (hwname,)).fetchone()
+                hw = float(hwrow[0]) if hwrow and hwrow[0] is not None else v
+                if v > hw:
+                    delta = int(v - hw)
                     jump = int(cfg.get("counters", {}).get("crc_jump_warning", 50))
-                    lvl = 2 if (delta >= jump or short != "crc") else 1
+                    if short == "crc":
+                        # monotone-counter EVENT, geen state-incident (§12):
+                        # severity volgt delta/snelheid; absolute teller is context
+                        recent = False
+                        pc = c.execute("select value from cursors where name=?",
+                                       (f"smart:{dev}:{short}:last_change",)).fetchone()
+                        if pc:
+                            try:
+                                pdt = datetime.fromisoformat(pc[0])
+                                recent = (datetime.now(timezone.utc) - pdt).total_seconds() < 6 * 3600
+                            except ValueError:
+                                recent = False
+                        if delta >= jump:
+                            lvl = 3   # grote sprong -> urgent
+                        elif (delta > 1 and recent) or delta >= 10:
+                            lvl = 2   # meerdere in korte tijd -> warning
+                        else:
+                            lvl = 1   # +1 incidenteel -> notice
+                    else:
+                        lvl = 2
+                    # counter-events: na resolve is ELKE nieuwe delta een nieuw
+                    # event (ook notice-niveau) — oud incident (+occurrences) weg
+                    prev_occ = 0
+                    srow = c.execute("select state, occurrences from incidents"
+                                     " where fingerprint=?", (f"disk:{dev}:{short}_growth",)).fetchone()
+                    if srow and srow[0] in ("resolved", "recovering"):
+                        prev_occ = srow[1] or 0
+                        c.execute("delete from incidents where fingerprint=?",
+                                  (f"disk:{dev}:{short}_growth",))
                     _, etype = incident_upsert(c, f"disk:{dev}:{short}_growth", source="deep",
                                                itype="smart_counter", sev_level=lvl, value=delta,
-                                               reason=f"{short} {int(prev)} -> {int(v)} (+{int(delta)})",
+                                               reason=f"{short} {int(hw)} -> {int(v)} (+{delta};"
+                                                      f" absolute teller {int(v)} is context)",
                                                )
-                    if etype in ("new", "escalated") or lvl >= 2:
+                    if etype == "new" and prev_occ:
+                        c.execute("update incidents set occurrences=occurrences+? where fingerprint=?",
+                                  (prev_occ, f"disk:{dev}:{short}_growth"))
+                    if etype in ("new", "escalated", "reopened"):
+                        c.execute("insert into cursors(name, value, last_checked)"
+                                  " values(?,?,?) on conflict(name) do update"
+                                  " set value=excluded.value, last_checked=excluded.last_checked",
+                                  (f"smart:{dev}:{short}:last_change", now_iso(), now_iso()))
                         events.append(emit("deep", "disk_health", f"disk:{dev}:{short}_growth",
-                                           current=int(v), previous=int(prev), severity=NAME[lvl],
+                                           current=int(v), previous=int(hw), severity=NAME[lvl],
                                            provisional=True, state="active", baseline_pending=True,
-                                           reason=f"monotone teller +{int(delta)} (delta-regel, §12)",
+                                           reason=f"monotone teller +{delta} boven maximum (§12)",
                                            source="deep"))
-                elif delta == 0 and short == "crc":
-                    pass  # identiek: geen event (§12)
+                elif v == hw:
+                    # counter op maximum ongewijzigd: event-incident sluit direct;
+                    # dezelfde counterwaarde mag nooit reminders genereren (§12)
+                    _, etype = incident_upsert(c, f"disk:{dev}:{short}_growth", source="deep",
+                                               itype="smart_counter", sev_level=0, value=v,
+                                               reason="counter ongewijzigd -> event afgesloten", )
+                    if etype == "resolved":
+                        events.append(emit("deep", "disk_health", f"disk:{dev}:{short}_growth",
+                                           current=int(v), severity="normal", provisional=True,
+                                           state="resolved", baseline_pending=True,
+                                           reason="counter ongewijzigd -> event afgesloten",
+                                           source="deep"))
+                # v < hw: dip = lees-artifact, geen event en geen state-reset
+                if v >= hw or hwrow is None:
+                    c.execute("insert into cursors(name, value, last_checked)"
+                              " values(?,?,?) on conflict(name) do update"
+                              " set value=excluded.value, last_checked=excluded.last_checked",
+                              (hwname, str(v), now_iso()))
         st["disks"] = len(dh["data"])
     else:
         events.append(emit("deep", "disk_health", "ssh:disk_health", severity="notice",
@@ -967,7 +1794,20 @@ def run_deep(cfg, events):
                 events.append(emit("deep", "array_status", "host:array:stopped", current=data.get("state"),
                                    severity="critical", provisional=True, state="active",
                                    baseline_pending=True, reason="array niet STARTED", source="deep"))
+        else:
+            _, etype = incident_upsert(c, "host:array:stopped", source="deep", itype="array",
+                                       sev_level=0, value=0, reason="array weer STARTED")
+            if etype == "resolved":
+                events.append(emit("deep", "array_status", "host:array:stopped", current="STARTED",
+                                   severity="normal", provisional=True, state="resolved",
+                                   baseline_pending=True, reason="array weer STARTED", source="deep"))
         if data.get("resync_pct") not in (None, 0, 100):
+            try:
+                import hermes_changes as hc
+                hc.record_change(c, "array_resync", "array", now_iso(),
+                                 f"{data.get('resync_action')} @ {data.get('resync_pct')}%")
+            except Exception:  # noqa: BLE001 — ledger mag deep-checks nooit storen
+                pass
             _, etype = incident_upsert(c, "host:array:resync", source="deep", itype="array",
                                        sev_level=1, value=data.get("resync_pct"),
                                        reason=f"resync {data.get('resync_action')} @ {data.get('resync_pct')}%",
@@ -977,6 +1817,15 @@ def run_deep(cfg, events):
                                    severity="notice", provisional=True, state="active",
                                    baseline_pending=True,
                                    reason="parity/resync werkelijk actief (pos/size, §13)", source="deep"))
+        else:
+            _, etype = incident_upsert(c, "host:array:resync", source="deep", itype="array",
+                                       sev_level=0, value=data.get("resync_pct"),
+                                       reason="resync klaar of geen data (pct 0/100/None)")
+            if etype == "resolved":
+                events.append(emit("deep", "array_status", "host:array:resync",
+                                   current=data.get("resync_pct"), severity="normal",
+                                   provisional=True, state="resolved", baseline_pending=True,
+                                   reason="resync afgerond", source="deep"))
         st["array"] = data.get("state")
 
     # pool read-only → CRITICAL (§10)
@@ -996,10 +1845,20 @@ def run_deep(cfg, events):
     loop_delta = int(cfg.get("docker_daemon", {}).get("restart_loop_delta", 3))
     ds = ssh_action("docker-status")
     if ds.get("ok"):
+        try:
+            import hermes_changes as hc
+        except Exception:  # noqa: BLE001 — change-ledger is optioneel
+            hc = None
         for cont in ds["data"]["containers"]:
             name = cont["name"]
             restarts = int(cont.get("restarts") or 0)
             state = cont["state"]
+            if hc is not None:
+                try:
+                    # fase 4: started/state-waarnemingen -> change-ledger
+                    hc.record_container_observation(c, name, state, cont.get("started"), now_iso())
+                except Exception:  # noqa: BLE001 — ledger mag deep-checks nooit storen
+                    pass
             prev, delta = counter(c, f"restarts:{name}", name, restarts)
             lvl = 2 if delta >= loop_delta else (1 if delta > 0 else 0)
             if lvl:
@@ -1013,7 +1872,28 @@ def run_deep(cfg, events):
                                        provisional=True, state="active", baseline_pending=True,
                                        reason=f"restart-delta +{int(delta)} (loop-kandidaat bij >= {loop_delta})",
                                        source="deep"))
-            if state != "running":
+            elif delta == 0:
+                # event-incident netjes afsluiten zodra de counter stilstaat
+                # (analoog OOM/SMART: ongewijzigde counter mag geen open incident achterlaten)
+                _, etype = incident_upsert(c, f"docker:{name}:restarts", source="deep",
+                                           itype="docker_restarts", sev_level=0, value=restarts,
+                                           reason="geen nieuwe restarts (delta 0)")
+                if etype == "resolved":
+                    events.append(emit("deep", "docker_restarts", f"docker:{name}:restarts",
+                                       current=restarts, severity="normal", provisional=True,
+                                       state="resolved", baseline_pending=True,
+                                       reason="geen nieuwe restarts -> incident afgesloten",
+                                       source="deep"))
+            # exited-classificatie: alleen bij verandering emit-ten; eerste
+            # waarneming = baseline (stil), cursor volgt de containerstate
+            cur_ex = c.execute("select value from cursors where name=?",
+                               (f"docker_exited:{name}",)).fetchone()
+            last_state = cur_ex[0] if cur_ex else None
+            c.execute("insert into cursors(name, value, last_checked) values(?,?,?)"
+                      " on conflict(name) do update set value=excluded.value,"
+                      " last_checked=excluded.last_checked",
+                      (f"docker_exited:{name}", state, now_iso()))
+            if state != "running" and last_state is not None and last_state != state:
                 events.append(emit("deep", "docker_exited", f"docker:{name}:exited", current=state,
                                    severity="notice", provisional=True, state="classified",
                                    baseline_pending=True,
@@ -1021,6 +1901,11 @@ def run_deep(cfg, events):
                                            if name in known else
                                            "exited container (niet in known_stopped)"), source="deep"))
         st["containers"] = ds["data"].get("count")
+        if hc is not None:
+            try:
+                hc.bounded_cleanup(c)  # fase 4: ledger hard begrensd
+            except Exception:  # noqa: BLE001
+                pass
 
     # vdisk deep-vs-sampler bevestiging
     dv = ssh_action("docker-vdisk-status")
@@ -1096,9 +1981,15 @@ def run_baseline(cfg, events):
                 cfg.get("temperatures", {}) if "temp" in m else
                 cfg.get("storage", {}) if m.endswith("_pct") else {})
         cur = sect.get("warn_pct") if sect else None
+        if "temp" in m:  # temperatuur-sectie gebruikt package_warn_c
+            cur = sect.get("package_warn_c")
         sugg = round(min(99.0, q(0.99) + 5), 1) if "temp" not in m else round(q(0.99) + 3, 1)
+        # fase 4: gemiddelde/stddev (goedkoop uit dezelfde reeks) + tijdsvenster
         out[m] = {"n": len(vals), "min": round(min(vals), 2), "p50": round(q(0.5), 2),
                   "p95": round(q(0.95), 2), "p99": round(q(0.99), 2), "max": round(max(vals), 2),
+                  "mean": round(statistics.mean(vals), 2),
+                  "stdev": round(statistics.stdev(vals), 2) if len(vals) > 1 else 0.0,
+                  "window_h": round((pts[-1][0] - pts[0][0]) / 3600, 1),
                   "typical_slope_per_h": round(statistics.median(slopes), 3) if slopes else None,
                   "current_warn": cur, "suggested_warn": sugg}
     (HL / "baseline-report.json").write_text(json.dumps(out, indent=1))
@@ -1133,6 +2024,24 @@ def run_test(cfg):
     results = []
     def check(name, cond, detail=""):
         results.append((name, bool(cond), detail))
+
+    # netdata/dumbscope (fase 9): tests raken nooit live endpoints. Deze
+    # defaults gelden voor alle helpers; scenario-helpers overschrijven ze per
+    # tmp-state en herstellen ze. _NoDs faalt exact zoals de echte client in
+    # test-omstandigheden (geen secrets) — zelfde failure-pad, geen HTTP.
+    import hermes_netdata as _hn
+    import hermes_dumbscope as _hd
+
+    class _NoNd:
+        def active_alarms(self):
+            return []
+
+    class _NoDs:
+        def poll(self, resolved_limit=20):
+            raise _hd.DumbScopeError("unavailable", None, "test: geen live HTTP")
+
+    _hn.make_client = lambda cfg_: _NoNd()
+    globals()["make_client"] = lambda cfg_: _NoDs()
 
     def fresh(series, minutes=5, seed_counters=None):
         tmp = Path(tempfile.mkdtemp())
@@ -1196,6 +2105,67 @@ def run_test(cfg):
                              seed_counters=[("oom_kills", "host", 2, 2)]))
     check("OOM +1 -> critical incident",
           inc.get("host:memory:oom", ("", ""))[1] == "critical", str(inc.get("host:memory:oom")))
+    def seq_eval(series, minutes=60, seed_counters=None):
+        """N opeenvolgende run_fast-calls (productie-getrouw: per sample een run,
+        gedeelde state-db) -> (incidents, events)."""
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        scon = sqlite3.connect(tmp / "homelab" / "agent_state.db")
+        if seed_counters:
+            scon.execute("create table counters(name text primary key, device text,"
+                         " previous_value real, current_value real, delta real, last_checked text)")
+            scon.executemany("insert into counters values(?,?,?,?,?,?)",
+                             [(n_, d_, p_, c_, 0, "seed") for n_, d_, p_, c_ in seed_counters])
+        scon.commit(); scon.close()
+        con = sqlite3.connect(tmp / "homelab" / "samples.db")
+        con.executescript(SAMPLES_SCHEMA)
+        now = int(datetime.now(timezone.utc).timestamp())
+        n = max(len(v) for v in series.values())
+        all_evs = []
+        for i in range(n):
+            cols = ["ts"] + list(series.keys())
+            vals = [now - (n - 1 - i) * minutes * 60] + \
+                   [s[i] if i < len(s) else s[-1] for s in series.values()]
+            con.execute(f"insert into samples({','.join(cols)})"
+                        f" values({','.join('?' for _ in cols)})", vals)
+            con.commit(); con.close()
+            old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+            globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                             STATE_DB=tmp / "homelab" / "agent_state.db",
+                             EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+            try:
+                evs = []
+                c2 = state_db()
+                run_fast(cfg, evs)
+                c2.close()
+                all_evs.extend(evs)
+            finally:
+                globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            con = sqlite3.connect(tmp / "homelab" / "samples.db")
+        con.close()
+        inc = {}
+        c2 = sqlite3.connect(tmp / "homelab" / "agent_state.db")
+        for fp, state, sev in c2.execute("select fingerprint, state, current_severity from incidents"):
+            inc[fp] = (state, sev)
+        c2.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+        return inc, all_evs
+
+    # OOM-lifecycle: 3->4 = 1 alert; 4->4 x3 = 0 extra; 4->5 = opnieuw alert
+    inc, evs = seq_eval({"mem_used_pct": [40] * 5, "oom_kills": [3, 4, 4, 4, 5]},
+                        seed_counters=[("oom_kills", "host", 3, 3)])
+    oom_alerts = [e for e in evs if e["check"] == "oom" and e["state"] == "active"]
+    oom_res = [e for e in evs if e["check"] == "oom" and e["state"] == "resolved"]
+    check("OOM 3->4 = 1 alert, 4->4 x3 = 0 extra, 4->5 = nieuwe alert",
+          len(oom_alerts) == 2 and len(oom_res) >= 1 and
+          inc.get("host:memory:oom", ("", ""))[0] == "active",
+          f"alerts={len(oom_alerts)} res={len(oom_res)} inc={inc.get('host:memory:oom')}")
+    inc, evs = seq_eval({"mem_used_pct": [40] * 4, "oom_kills": [4, 4, 4, 4]},
+                        seed_counters=[("oom_kills", "host", 3, 4)])
+    check("OOM counter unchanged -> geen incident, geen alerts",
+          "host:memory:oom" not in inc and
+          not [e for e in evs if e["check"] == "oom" and e["state"] == "active"],
+          str(inc.get("host:memory:oom")))
     # Docker vDisk
     inc, _ = eval_in(fresh({"vdisk_pct": [70] * 8, "vdisk_used_kb": [107374182] * 8}))
     check("vdisk stabiel 70 -> geen incident",
@@ -1204,24 +2174,58 @@ def run_test(cfg):
     inc, _ = eval_in(fresh({"vdisk_pct": [70] * 12 + [80], "vdisk_used_kb": [kb0] * 12 + [kb1]}))
     check("vdisk 70->80 in 1u -> growth warning",
           inc.get("host:docker_vdisk:growth", ("", ""))[1] == "warning", str(inc.get("host:docker_vdisk:growth")))
+    # +300MB/uur (limiet 2 GiB/uur) -> geen growth-warning
+    kb300 = [107374182 + i * 307200 for i in range(12)]  # ~100GiB + 300MB/u
+    inc, _ = eval_in(fresh({"vdisk_pct": [70] * 12, "vdisk_used_kb": kb300}, minutes=60))
+    check("vdisk +300MB/uur -> geen growth-warning",
+          "host:docker_vdisk:growth" not in inc, str(inc.get("host:docker_vdisk:growth")))
+    # +3GB/uur -> wel growth-warning
+    kb3g = [107374182 + i * 3145728 for i in range(12)]
+    inc, _ = eval_in(fresh({"vdisk_pct": [70] * 12, "vdisk_used_kb": kb3g}, minutes=60))
+    check("vdisk +3GB/uur -> growth warning",
+          inc.get("host:docker_vdisk:growth", ("", ""))[1] == "warning", str(inc.get("host:docker_vdisk:growth")))
+    # groei stopt -> RESOLVED (actueel normaal = geen reminders meer)
+    kbstop = [107374182 + i * 3145728 for i in range(12)] + [107374182 + 11 * 3145728] * 3
+    inc, evs = seq_eval({"vdisk_pct": [70] * 15, "vdisk_used_kb": kbstop}, minutes=60)
+    check("vdisk groei stopt -> resolved",
+          inc.get("host:docker_vdisk:growth", ("", ""))[0] == "resolved",
+          str(inc.get("host:docker_vdisk:growth")))
     inc, _ = eval_in(fresh({"vdisk_pct": [95, 95, 90, 84, 80]}))
     check("vdisk 95->80 dalend -> recovering/resolved",
           inc.get("host:docker_vdisk:high", ("missing", "?"))[0] in ("resolved", "recovering"),
           str(inc.get("host:docker_vdisk:high")))
-    # Temperatuur (§7)
-    inc, _ = eval_in(fresh({"package_temp_c": [75, 75, 93]}))
-    check("temp één sample 93 -> notice (cap)",
-          inc.get("host:temperature:package", ("", ""))[1] == "notice", str(inc.get("host:temperature:package")))
-    inc, _ = eval_in(fresh({"package_temp_c": [93, 93, 93]}))
-    check("temp sustained 93 -> warning",
-          inc.get("host:temperature:package", ("", ""))[1] == "warning", str(inc.get("host:temperature:package")))
-    inc, _ = eval_in(fresh({"package_temp_c": [93, 93, 88, 84, 82]}))
-    check("temp 93->82 dalend -> recovering/resolved",
-          inc.get("host:temperature:package", ("missing", "?"))[0] in ("resolved", "recovering"),
+    # Temperatuur (§7 + §7b micro-spike-beleid, 2026-09-23)
+    # Banden (thresholds.yaml temperatures): warn=95, urgent=98, crit=100,
+    # sustained_minutes=10 (need=2), critical_needs_sustain, urgent_sustained_samples=3.
+    inc, evs = eval_in(fresh({"package_temp_c": [70, 100, 70]}))
+    check("temp 70->100->70: losse 100C-sample -> geen telegram-waardig event",
+          evs and all(e["severity"] not in ("warning", "urgent", "critical") for e in evs),
+          str([(e["severity"], e["state"]) for e in evs]))
+    inc, _ = eval_in(fresh({"package_temp_c": [70, 100, 70]}))
+    check("temp 70->100->70: geen critical, herstel werkt",
+          inc.get("host:temperature:package", ("", ""))[1] != "critical"
+          and inc.get("host:temperature:package", ("missing", "?"))[0] in ("resolved", "recovering"),
           str(inc.get("host:temperature:package")))
-    inc, _ = eval_in(fresh({"package_temp_c": [80, 85, 90, 94]}))
-    check("temp 80->85->90->94 stijgend -> urgent",
+    inc, evs = eval_in(fresh({"package_temp_c": [96, 97, 70]}))
+    check("temp 96->97->70: 2 opeenvolgende >=95 -> warning (max warning, geen urgent/critical)",
+          any(e["severity"] == "warning" for e in evs)
+          and not any(e["severity"] in ("urgent", "critical") for e in evs),
+          str([(e["severity"], e["state"]) for e in evs]))
+    inc, _ = eval_in(fresh({"package_temp_c": [96, 97, 70]}))
+    check("temp 96->97->70: daarna recovering/resolved",
+          inc.get("host:temperature:package", ("missing", "?"))[0] in ("recovering", "resolved"),
+          str(inc.get("host:temperature:package")))
+    inc, _ = eval_in(fresh({"package_temp_c": [96, 96, 96]}))
+    check("temp >=95 sustained >=10 min (3 samples) -> urgent",
           inc.get("host:temperature:package", ("", ""))[1] == "urgent", str(inc.get("host:temperature:package")))
+    inc, _ = eval_in(fresh({"package_temp_c": [100, 100, 100]}))
+    check("temp sustained 100C -> critical (behouden)",
+          inc.get("host:temperature:package", ("", ""))[1] == "critical", str(inc.get("host:temperature:package")))
+    inc, evs = seq_eval({"package_temp_c": [96] * 5}, minutes=5)
+    sev_seq = [(e["severity"], e["state"]) for e in evs
+               if e["fingerprint"].startswith("host:temperature")]
+    check("temp severity gehouden -> geen duplicate events (alleen temp-fingerprints)",
+          len(sev_seq) == len(set(sev_seq)), str(sev_seq))
     # /var/log
     inc, _ = eval_in(fresh({"logfs_pct": [60] * 12 + [68]}))
     check("logfs snelle groei -> warning growth",
@@ -1278,6 +2282,39 @@ def run_test(cfg):
               len(crc_ev) == 1 and crc_ev[0]["severity"] == "notice", str(crc_ev)[:140])
         check("SMART pending 0->1 -> warning (absolute)",
               len(pend_ev) == 1 and pend_ev[0]["severity"] == "warning", str(pend_ev)[:140])
+    finally:
+        globals()["ssh_action"] = real_ssh
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+    # CRC-event-lifecycle (§12): 458809->458810 = 1 alert; unchanged = 0;
+    # 458810->458811 = nieuwe alert; +50 sprong = zwaardere (urgent) alert
+    steps2 = [dh(458809, 0, 0, 0), dh(458810, 0, 0, 0), dh(458810, 0, 0, 0),
+              dh(458811, 0, 0, 0), dh(458861, 0, 0, 0)]
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db", STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    fake, i = fake_ssh_factory(steps2)
+    globals()["ssh_action"] = fake
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        run_events = []
+        for step in range(5):
+            evs = []; con = state_db(); run_deep(cfg, evs); con.close()
+            run_events.append(evs)
+            i["n"] = step + 1
+        def crc_alerts(k):
+            return [e for e in run_events[k]
+                    if e.get("fingerprint") == "disk:/dev/sda:crc_growth" and e["state"] == "active"]
+        crc_resolved = [e for evs in run_events for e in evs
+                        if e.get("fingerprint") == "disk:/dev/sda:crc_growth" and e["state"] == "resolved"]
+        check("crc 458809->458810 = precies 1 alert", len(crc_alerts(1)) == 1, str(crc_alerts(1)))
+        check("crc 458810->458810 = 0 alerts (geen reminders)",
+              len(crc_alerts(2)) == 0 and len(crc_resolved) >= 1,
+              f"{len(crc_alerts(2))}/{len(crc_resolved)}")
+        check("crc 458810->458811 = nieuwe alert", len(crc_alerts(3)) == 1, str(crc_alerts(3)))
+        check("crc 458811->458861 (+50) = urgent alert",
+              len(crc_alerts(4)) == 1 and crc_alerts(4)[0]["severity"] == "urgent", str(crc_alerts(4)))
     finally:
         globals()["ssh_action"] = real_ssh
         globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
@@ -1566,6 +2603,14 @@ def run_test(cfg):
     check("router 14: incidentlimiet -> geen call (audit)",
           final.get("status") == "skipped" and final.get("reason") == "llm_budget_exhausted:incident",
           str(final))
+    # 14b: globale daglimiet blijft gelden na episode-reset (budget per episode
+    # mag de dagcap niet omzeilen)
+    final, calls_ = hr.analyze("dumbscope:mystery", source="dumbscope", severity="warning",
+                               task="t", context=dsc, llm_cfg=llmcfg, api_key="test",
+                               per_incident_calls=0, daily_calls=8, multi_system=False)
+    check("budget 14b: daily-cap limiteert nog na episode-reset",
+          final.get("status") == "skipped" and final.get("reason") == "llm_budget_exhausted:daily",
+          str(final))
     # 15: requested != actual -> routing violation, response onvertrouwd -> DeepSeek
     queue = [or_resp(hr.MODELS["tier2"], ling_content(0.95)),
              or_resp(hr.MODELS["tier2"], json.dumps({"diagnosis": "d", "confidence": 0.7,
@@ -1600,8 +2645,10 @@ def run_test(cfg):
 
     # 10/11/12: unchanged/escalatie/reopen op evaluator-niveau (hash + analyze-teller)
     analyze_calls = {"n": 0}
+    analyze_budget_seen = []
     def fake_analyze(fp, **kw):
         analyze_calls["n"] += 1
+        analyze_budget_seen.append(kw.get("per_incident_calls"))
         return ({"status": "done", "tier": "tier1", "analysis": {"summary": "ok"},
                  "confidence": 0.9}, [{"success": True, "actual_model": hr.MODELS["tier1"]}])
     tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
@@ -1649,6 +2696,28 @@ def run_test(cfg):
         con.commit()
         s4 = run_llm_layer(llm_on, con, [])  # reopen + occurrences -> nieuw
         n4 = analyze_calls["n"]
+        # budget per episode: resolve en reopen resetten llm_call_count
+        con.execute("update incidents set llm_call_count=3, llm_context_hash=NULL"
+                    " where fingerprint='dumbscope:mystery'")
+        con.commit()
+        incident_upsert(con, "dumbscope:mystery", source="dumbscope", itype="ds",
+                        sev_level=0, value=0, reason="test: resolve")
+        rowb = con.execute("select llm_call_count from incidents"
+                           " where fingerprint='dumbscope:mystery'").fetchone()
+        check("budget-episode 1: resolve reset llm_call_count", rowb == (0,), str(rowb))
+        con.execute("update incidents set llm_call_count=3"
+                    " where fingerprint='dumbscope:mystery'")
+        con.commit()
+        incident_upsert(con, "dumbscope:mystery", source="dumbscope", itype="ds",
+                        sev_level=2, value=1, reason="test: reopen")
+        rowb = con.execute("select llm_call_count from incidents"
+                           " where fingerprint='dumbscope:mystery'").fetchone()
+        check("budget-episode 2: reopen reset llm_call_count", rowb == (0,), str(rowb))
+        n4b = analyze_calls["n"]
+        s5 = run_llm_layer(llm_on, con, [])
+        check("budget-episode 3: nieuwe episode analyseert met fris incident-budget",
+              analyze_calls["n"] > n4b and analyze_budget_seen[-1] == 0,
+              f"n={analyze_calls['n']}>{n4b}, per_incident={analyze_budget_seen[-1:] if analyze_budget_seen else 'geen'}")
         hr.analyze = hr_analyze_real
         con.close()
         check("router 10: ongewijzigd incident -> geen nieuwe analyse", n2 == n1, f"{n1}->{n2}")
@@ -1660,6 +2729,689 @@ def run_test(cfg):
         hr.load_env_key = hr_lev_real
         _sh.rmtree(tmp, ignore_errors=True)
 
+    # ── replay-transities (notificatie-veiligheid) ──
+    def eval_pending(series, minutes=5):
+        """Één run_fast over N al aanwezige samples (replay) ->
+        (pending_transitions, incidents, events)."""
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        try:
+            con = sqlite3.connect(SAMPLES_DB)
+            con.executescript(SAMPLES_SCHEMA)
+            now = int(datetime.now(timezone.utc).timestamp())
+            n = max(len(v) for v in series.values())
+            cols = ["ts"] + list(series.keys())
+            for i in range(n):
+                vals = [now - (n - 1 - i) * minutes * 60] + \
+                       [s[i] if i < len(s) else s[-1] for s in series.values()]
+                con.execute(f"insert into samples({','.join(cols)})"
+                            f" values({','.join('?' for _ in cols)})", vals)
+            con.commit(); con.close()
+            evs = []
+            con = state_db(); run_fast(cfg, evs); con.close()
+            c2 = sqlite3.connect(STATE_DB)
+            pend = c2.execute("select fingerprint, event_type, severity from pending_transitions"
+                              " order by id").fetchall()
+            incs = {fp: (st, sv) for fp, st, sv in c2.execute(
+                "select fingerprint, state, current_severity from incidents")}
+            c2.close()
+            return pend, incs, evs
+        finally:
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # A: normal → critical → resolved binnen één replay-run
+    pend, incs, _ = eval_pending({"mem_used_pct": [97, 80, 80]})
+    check("replay A: critical→resolved in één run -> critical-transitie bewaard",
+          pend == [("host:memory:high", "new", "critical")], str(pend))
+    check("replay A: eindstate resolved",
+          incs.get("host:memory:high", ("",))[0] == "resolved", str(incs.get("host:memory:high")))
+    # B: warning-escalatie binnen replay -> exact één transitie
+    pend, _, _ = eval_pending({"mem_used_pct": [90, 90, 90]})
+    check("replay B: notice-cap → warning-escalatie -> één transitie vastgelegd",
+          pend == [("host:memory:high", "escalated", "warning")], str(pend))
+    # D: critical → resolved → critical binnen één replay-run
+    pend, incs, _ = eval_pending({"mem_used_pct": [97, 80, 80, 97]})
+    check("replay D: critical→resolved→critical -> new + reopened vastgelegd",
+          pend == [("host:memory:high", "new", "critical"),
+                   ("host:memory:high", "reopened", "critical")], str(pend))
+    check("replay D: eindstate active critical",
+          incs.get("host:memory:high") == ("active", "critical"), str(incs.get("host:memory:high")))
+    # gezonde reeks: geen transities, geen pending
+    pend, _, _ = eval_pending({"mem_used_pct": [40, 41, 42]})
+    check("replay healthy: geen pending-transities", pend == [], str(pend))
+
+    # ── stale-resolve: state-incidenten sluiten bij gezonde waarde ──
+    # (deze regels kijken per run naar de laatste sample -> scenario over
+    #  opeenvolgende runs met gedeelde state-db)
+    inc, _ = seq_eval({"containers_unhealthy": [3, 3, 0]}, minutes=5)
+    check("stale 1: unhealthy 3→3→0 over runs -> incident resolved",
+          inc.get("host:containers:unhealthy", ("missing", ""))[0] == "resolved",
+          str(inc.get("host:containers:unhealthy")))
+    inc, _ = seq_eval({"swap_used_kb": [300000, 0]}, minutes=5)
+    check("stale 2: swap actief→0 over runs -> resolved",
+          inc.get("host:swap:active", ("missing", ""))[0] == "resolved",
+          str(inc.get("host:swap:active")))
+    inc, _ = seq_eval({"containers_unhealthy": [3, 0, 0]}, minutes=5)
+    check("stale 1b: na resolved geen her-open incident door blijvend 0",
+          inc.get("host:containers:unhealthy", ("missing", ""))[0] == "resolved",
+          str(inc.get("host:containers:unhealthy")))
+
+    # stale-resolve: restart-delta 0 sluit het restart-incident (deep)
+    rseq = [{"ok": True, "data": {"count": 1, "containers": [
+        {"name": "plex", "state": "running", "health": "healthy", "restarts": rs,
+         "started": "2026-01-01T00:00:00", "exit_code": 0, "mem_limit_bytes": 0}]}}
+        for rs in (7, 10, 10)]
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db", STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    fake, i = fake_ssh_factory(rseq, disk_health={"ok": True, "data": []},
+                               docker_status=rseq)
+    globals()["ssh_action"] = fake
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        for step in range(3):
+            evs = []; con = state_db(); run_deep(cfg, evs); con.close()
+            i["n"] = step + 1
+        c2 = sqlite3.connect(STATE_DB)
+        rrow = c2.execute("select state from incidents"
+                          " where fingerprint='docker:plex:restarts'").fetchone()
+        c2.close()
+        check("stale 3: restart +3 -> incident; delta 0 -> resolved", rrow == ("resolved",), str(rrow))
+    finally:
+        globals()["ssh_action"] = real_ssh
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # docker_exited dedup: eerste waarneming = baseline (stil), emit alleen bij verandering
+    def dstate(st):
+        return {"ok": True, "data": {"count": 1, "containers": [
+            {"name": "plex", "state": st, "health": "healthy", "restarts": 0,
+             "started": "2026-01-01T00:00:00", "exit_code": 0, "mem_limit_bytes": 0}]}}
+    eseq = [dstate("exited"), dstate("exited"), dstate("running"), dstate("exited")]
+    tmp = Path(tempfile.mkdtemp()); (tmp / "homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db", STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    fake, i = fake_ssh_factory(eseq, disk_health={"ok": True, "data": []},
+                               docker_status=eseq)
+    globals()["ssh_action"] = fake
+    try:
+        con = sqlite3.connect(SAMPLES_DB); con.close()
+        all_exit_evs = []
+        for step in range(4):
+            evs = []; con = state_db(); run_deep(cfg, evs); con.close()
+            all_exit_evs.extend(e for e in evs if e["check"] == "docker_exited")
+            i["n"] = step + 1
+        check("exited-dedup: baseline stil, alleen verandering -> 1 emit in 4 runs",
+              len(all_exit_evs) == 1 and all_exit_evs[0]["current"] == "exited",
+              str([(e["current"], e["ts"]) for e in all_exit_evs]))
+    finally:
+        globals()["ssh_action"] = real_ssh
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── fase 4 (§8): deploy/evaluator-locking ──
+    import fcntl as _fcntl
+    tmp = Path(tempfile.mkdtemp()); tmp.joinpath("homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "none.db",
+                     STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "events.jsonl")
+    try:
+        fd, why = acquire_deploy_lock(timeout_s=1, poll_s=1, path=tmp / "homelab" / "deploy.lock")
+        check("lock 1: vrije deploy-lock -> LOCK_SH verkregen", fd is not None and why is None, str(why))
+        if fd:
+            _fcntl.flock(fd, _fcntl.LOCK_UN); fd.close()
+        holder = open(tmp / "homelab" / "deploy.lock", "w")
+        _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # simuleert lopende deploy
+        fd2, why2 = acquire_deploy_lock(timeout_s=1, poll_s=1, path=tmp / "homelab" / "deploy.lock")
+        check("lock 2: bezette deploy-lock -> timeout, run overslaat (niet blokkeert)",
+              fd2 is None and why2 is not None, str(why2))
+        _fcntl.flock(holder, _fcntl.LOCK_UN); holder.close()
+        fd3, why3 = acquire_deploy_lock(timeout_s=1, poll_s=1, path=tmp / "homelab" / "deploy.lock")
+        check("lock 3: na einde deploy -> lock weer verkrijgbaar",
+              fd3 is not None, str(why3))
+        if fd3:
+            _fcntl.flock(fd3, _fcntl.LOCK_UN); fd3.close()
+    finally:
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── fase 4: change-ledger in de fast-run (deploy-events + occurrence-log) ──
+    tmp = Path(tempfile.mkdtemp()); tmp.joinpath("homelab").mkdir(parents=True)
+    old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+    globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                     STATE_DB=tmp / "homelab" / "agent_state.db",
+                     EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+    try:
+        con = sqlite3.connect(SAMPLES_DB)
+        con.executescript(SAMPLES_SCHEMA)
+        now = int(datetime.now(timezone.utc).timestamp())
+        for i in range(3):
+            con.execute("insert into samples(ts, mem_used_pct, oom_kills) values(?,?,?)",
+                        (now - (3 - i) * 300, 40, 2))
+        con.commit(); con.close()
+        (tmp / "homelab" / "changes-deploy.jsonl").write_text(
+            json.dumps({"ts": now_iso(), "kind": "deploy", "key": "hermes",
+                        "detail": "regressietest"}) + "\n")
+        con = state_db()
+        evs = []
+        run_fast(cfg, evs)
+        n_changes = con.execute("select count(*) from changes").fetchone()[0]
+        con.close()
+        c2 = sqlite3.connect(STATE_DB)
+        led = c2.execute("select kind, key from changes").fetchall()
+        c2.close()
+        check("changes 1: fast-run leest deploy-events in de ledger",
+              led == [("deploy", "hermes")], str(led))
+        # occurrence-log: warning-transitie vastgelegd door incident_upsert
+        tmp2 = Path(tempfile.mkdtemp()); tmp2.joinpath("homelab").mkdir(parents=True)
+        globals().update(SAMPLES_DB=tmp2 / "homelab" / "samples.db",
+                         STATE_DB=tmp2 / "homelab" / "agent_state.db",
+                         EVENTS=tmp2 / "homelab" / "events.jsonl")
+        scon = sqlite3.connect(SAMPLES_DB)
+        scon.executescript(SAMPLES_SCHEMA)
+        for i in range(3):
+            scon.execute("insert into samples(ts, mem_used_pct) values(?,?)",
+                         (now - (3 - i) * 300, 95))
+        scon.commit(); scon.close()
+        con = state_db()
+        evs = []
+        run_fast(cfg, evs)
+        rows = con.execute("select fingerprint, count(*) from occurrence_log"
+                           " group by fingerprint").fetchall()
+        con.close()
+        check("changes 2: warning-transitie -> occurrence_log gevuld",
+              rows and rows[0][0] == "host:memory:high" and rows[0][1] >= 1, str(rows))
+    finally:
+        globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    # ── fase 7: infinidysk per-bestand repair-loop-detectie ──────────────────
+    import hermes_infinidysk as _hi
+    from zoneinfo import ZoneInfo
+    T = int(datetime.now(timezone.utc).timestamp())
+
+    def inf_line(ts, s):
+        dt = datetime.fromtimestamp(ts, ZoneInfo("Europe/Amsterdam"))
+        mon = [k for k, v in _hi.MONTHS.items() if v == dt.month][0]
+        pre = (f"{mon} {dt.day:02d}, {dt.year} {dt.strftime('%H:%M:%S')} - INFO"
+               f" - InfiniDysk subprocess: [{dt.strftime('%H:%M:%S')} INF] ")
+        return pre + s
+
+    def inf_rep(ts, path):
+        return inf_line(ts, f"Health check classified {path} as failed: 100"
+                            f" missing/corrupt segment(s) Starting repair.")
+
+    def inf_new(now_ts):
+        tmp = Path(tempfile.mkdtemp()); tmp.joinpath("homelab").mkdir(parents=True)
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        return {"tmp": tmp, "old": old, "log": tmp / "infinidysk.log", "now": now_ts}
+
+    def inf_run(state, lines=(), now_ts=None):
+        with state["log"].open("a") as f:
+            for l in lines:
+                f.write(l + "\n")
+        con = state_db()
+        evs = []
+        icfg = {"infinidysk": {"log_path": str(state["log"]),
+                               "warning_count": 5, "urgent_count": 10,
+                               "window_minutes": 60, "resolve_after_minutes": 120},
+                "defaults": {}}
+        run_infinidysk(icfg, con, evs, mode="fast", now=now_ts or state["now"])
+        con.close()
+        c2 = sqlite3.connect(STATE_DB)
+        inc = {fp: (stt, sev) for fp, stt, sev in c2.execute(
+            "select fingerprint, state, current_severity from incidents"
+            " where fingerprint like 'infinidysk:%'")}
+        pend = c2.execute("select count(*) from pending_transitions where"
+                          " fingerprint like 'infinidysk:%'").fetchone()[0]
+        c2.close()
+        return inc, evs, pend
+
+    def inf_close(state):
+        globals().update(HOME=state["old"][0], SAMPLES_DB=state["old"][1],
+                         STATE_DB=state["old"][2], EVENTS=state["old"][3])
+        shutil.rmtree(state["tmp"], ignore_errors=True)
+
+    RAW_A = "/content/tv/Release.One.2026.S01E01/File.One.mkv"
+    RAW_B = "/content/tv/Release.Two.2026.S01E01/File.Two.mkv"
+    RAW_C = "/content/tv/Release.Three.2026.S01E01/File.Three.mkv"
+    RAW_D = "/content/tv/Release.Four.2026.S01E01/File.Four.mkv"
+    RAW_E = "/content/tv/Release.Old.2026.S01E01/File.Old.mkv"
+    FP_A = "infinidysk:repair_loop:" + _hi.fingerprint(_hi.normalize_path(RAW_A))
+
+    st1 = inf_new(T)
+    try:
+        inc, evs, pend = inf_run(st1)  # seed-run op leeg log
+        check("INF 0: seed-run op leeg log -> 0 events, 0 incidenten, 0 pending",
+              not evs and not inc and pend == 0, str((len(evs), inc, pend)))
+        # Test 2: 5 repairs/60min -> warning (+ pending_transition)
+        inc, evs, pend = inf_run(st1, [inf_rep(T - i * 300, RAW_A)
+                                       for i in range(5)])
+        check("INF 2: 5 repairs/60min -> warning-incident + pending",
+              inc.get(FP_A, ("", ""))[1] == "warning" and pend >= 1,
+              str((inc.get(FP_A), pend)))
+        # Test 1: 4 repairs/60min -> GEEN warning (notice, geen pending)
+        inc, evs, pend = inf_run(st1, [inf_rep(T - i * 300, RAW_B)
+                                       for i in range(4)])
+        check("INF 1: 4 repairs/60min -> geen warning-incident",
+              inc.get("infinidysk:repair_loop:" +
+                      _hi.fingerprint(_hi.normalize_path(RAW_B)),
+                      ("", ""))[1] != "warning",
+              str(inc))
+        # Test 3: 10 repairs/60min -> urgent/escalatie
+        fp_c = "infinidysk:repair_loop:" + _hi.fingerprint(
+            _hi.normalize_path(RAW_C))
+        inc, evs, pend = inf_run(st1, [inf_rep(T - i * 120, RAW_C)
+                                       for i in range(10)])
+        check("INF 3: 10 repairs/60min -> urgent",
+              inc.get(fp_c, ("", ""))[1] == "urgent", str(inc.get(fp_c)))
+        # Test 4: licht verschillend pad -> zelfde fingerprint (merge)
+        inc, evs, pend = inf_run(st1, [
+            inf_rep(T - 60, "/content/sonarr-default/release.one.2026.s01e01/file.one.mkv"),
+            inf_rep(T - 30, "/content/tv/Release.One.2026.S01E01 (2)/File.One.mkv")])
+        n_a = sqlite3.connect(STATE_DB).execute(
+            "select count(*) from infinidysk_repairs where fingerprint=?",
+            (FP_A,)).fetchone()[0]
+        check("INF 4: padvariaties -> zelfde fingerprint, telling gemerged",
+              n_a == 7 and inc.get(FP_A, ("", ""))[1] == "warning",
+              str((n_a, inc.get(FP_A))))
+        # Test 5: verschillende files -> afzonderlijke incidenten
+        check("INF 5: aparte bestanden -> aparte incidenten",
+              len(inc) == 3 and all(v[0] == "active" for v in inc.values()),
+              str(inc))
+        # Test 8: duplicate ingest -> niet dubbel tellen
+        dup = inf_rep(T - 120, RAW_A)
+        inc, evs, pend2 = inf_run(st1, [dup, dup])
+        n_a2 = sqlite3.connect(STATE_DB).execute(
+            "select count(*) from infinidysk_repairs where fingerprint=?",
+            (FP_A,)).fetchone()[0]
+        check("INF 8: exact dubbele regels -> 1 extra telling, geen extra pending",
+              n_a2 == 8 and pend2 == pend, str((n_a2, pend, pend2)))
+        # Test 6: repair buiten rolling window (90 min oud) -> notice, open
+        inc, evs, pend = inf_run(st1, [inf_rep(T - 90 * 60, RAW_D)])
+        fp_d = "infinidysk:repair_loop:" + _hi.fingerprint(
+            _hi.normalize_path(RAW_D))
+        check("INF 6: repair buiten 60min-window -> geen warning, wel open",
+              inc.get(fp_d, ("", ""))[1] == "notice", str(inc.get(fp_d)))
+        # Test 7: 2 uur geen repairs -> resolved
+        inc, evs, pend = inf_run(st1, now_ts=T + 131 * 60)
+        check("INF 7: >2h zonder repairs -> resolved",
+              inc.get(fp_d, ("", ""))[0] == "resolved", str(inc.get(fp_d)))
+    finally:
+        inf_close(st1)
+
+    # Test 9: gezonde run -> 0 events, 0 pending, 0 LLM-route
+    st2 = inf_new(T)
+    try:
+        fp_e = "infinidysk:repair_loop:" + _hi.fingerprint(
+            _hi.normalize_path(RAW_E))
+        inc, evs, pend = inf_run(st2, [
+            inf_rep(T - 3 * 3600, RAW_E),
+            inf_line(T - 3 * 3600 + 60,
+                     f"PAR2 repair error for {RAW_E} Reason: Article with"
+                     f" message-id x@y not found. Server responded: 430 No"
+                     f" such article")])
+        check("INF 9: gezonde run (alleen oude repairs) -> 0 events, 0 pending",
+              not evs and pend == 0 and not inc, str((len(evs), inc, pend)))
+        con = state_db()
+        route, why = needs_llm_analysis(con, fp_e, "warning", "active")
+        con.close()
+        check("INF 9b: 430/dode-artikelen-reden -> Tier-0 LLM-skip",
+              route is False and "skip:" in why, f"{route} {why}")
+    finally:
+        inf_close(st2)
+
+    # ------------------------------------------------------------------
+    # Netdata-alarminput (fase 8): client gemockt — tests doen nooit live
+    # HTTP naar Netdata. Eén poll = één run_fast; alarm-set per poll.
+    import hermes_netdata as hn
+
+    class _FakeNd:
+        def __init__(self, polls):
+            self.polls = list(polls)
+            self.i = 0
+
+        def active_alarms(self):
+            p = self.polls[self.i] if self.i < len(self.polls) else []
+            self.i += 1
+            if p == "FAIL":
+                raise hn.NetdataError("unavailable", None, "test-timeout")
+            return p
+
+    def nd_raw(name, chart, status, value, info="test"):
+        return {"id": 1, "name": name, "chart": chart, "status": status,
+                "value": value, "info": info, "last_status_change": 1790208000,
+                "active": True, "disabled": False, "silenced": False}
+
+    def nd_run(polls, samples):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        con = sqlite3.connect(tmp / "homelab" / "samples.db")
+        con.executescript(SAMPLES_SCHEMA)
+        n_ = max(len(v) for v in samples.values())
+        now = int(datetime.now(timezone.utc).timestamp())
+        cols = ["ts"] + list(samples.keys())
+        for i in range(n_):
+            vals = [now - (n_ - i) * 300]
+            for seq in samples.values():
+                vals.append(seq[i] if i < len(seq) else seq[-1])
+            con.execute(f"insert into samples({','.join(cols)})"
+                        f" values({','.join('?' for _ in cols)})", vals)
+        con.commit(); con.close()
+        fake = _FakeNd(polls)
+        old_make = hn.make_client
+        hn.make_client = lambda cfg_: fake
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        inc, evs, pend = {}, [], []
+        summaries = []
+        try:
+            con = state_db()
+            for _ in polls:
+                evs_run = []
+                summaries.append(run_fast(cfg, evs_run))
+                evs += evs_run
+            con.close()
+            c2 = sqlite3.connect(STATE_DB)
+            for fp, state, sev in c2.execute(
+                    "select fingerprint, state, current_severity from incidents"):
+                inc[fp] = (state, sev)
+            pend = [tuple(r) for r in c2.execute(
+                "select fingerprint, event_type, severity from pending_transitions order by id")]
+            c2.close()
+            return inc, evs, pend, summaries
+        finally:
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            hn.make_client = old_make
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ND 1: allowlist/normalisatie (pure functies, geen state)
+    check("ND1a: ephemeral container (UNDEFINED-status) -> genegeerd (ruisfilter)",
+          hn.normalize(nd_raw("docker_container_unhealthy",
+                              "docker_local.container_x_health_status",
+                              "UNDEFINED", 0)) is None)
+    n_dumb = hn.normalize(nd_raw("docker_container_unhealthy",
+                                 "docker_local.container_DUMB_health_status",
+                                 "WARNING", 0.8))
+    check("ND1b: DUMB container health -> netdata:container:DUMB warning",
+          bool(n_dumb) and n_dumb["fingerprint"] == "netdata:container:DUMB"
+          and n_dumb["severity"] == "warning", str(n_dumb))
+    check("ND1c: alarm buiten allowlist -> genegeerd (nooit blind doorsturen)",
+          hn.normalize(nd_raw("some_random_alarm", "system.ips", "CRITICAL", 5)) is None)
+    check("ND1d: cgroup-alarm buiten scope (VM/container-ruis)",
+          hn.normalize(nd_raw("cgroup_ram_in_use",
+                              "cgroup_qemu_qemu_5.mem_usage", "WARNING", 80)) is None)
+
+    # ND 2: netdata warning + hermes normal (covered) -> evidence-only
+    inc, evs, pend, nd_sum = nd_run(
+        [[], [nd_raw("ram_in_use", "system.ram", "WARNING", 91.0, "ram")]],
+        {"mem_used_pct": [60, 61, 62]})
+    check("ND2a: netdata RAM warning + hermes normaal -> GEEN netdata-incident",
+          "netdata:memory:ram_in_use" not in inc and "host:memory:high" not in inc, str(inc))
+    check("ND2b: covered warning -> geen pending transitions (geen Telegram)",
+          pend == [], str(pend))
+    check("ND2c: covered warning -> evidence-event vastgelegd",
+          any(e["fingerprint"] == "netdata:memory:ram_in_use"
+              and e.get("dedup") == "covered_evidence_only" for e in evs), str(len(evs)))
+
+    # ND 3: netdata critical + bevestigende hermes-metric -> escalatie hermes-fp
+    inc, evs, pend, nd_sum = nd_run(
+        [[], [nd_raw("ram_in_use", "system.ram", "CRITICAL", 97.0, "ram")]],
+        {"mem_used_pct": [92, 92, 92]})
+    check("ND3a: netdata critical + hermes 92 (>=warn) -> host:memory:high critical",
+          inc.get("host:memory:high") == ("active", "critical"),
+          str(inc.get("host:memory:high")))
+    check("ND3b: confirm -> pending op hermes-fp, GEEN netdata-duplicaat",
+          any(p[0] == "host:memory:high" and p[1] == "escalated" and p[2] == "critical"
+              for p in pend)
+          and not any(p[0].startswith("netdata:") for p in pend), str(pend))
+
+    # ND 4: duplicate alarm (tweede identieke poll)
+    LOAD_W = nd_raw("load_average_15", "system.load", "WARNING", 40.0, "load")
+    inc, evs, pend, nd_sum = nd_run([[], [LOAD_W], [dict(LOAD_W)]], {"mem_used_pct": [40]})
+    check("ND4: duplicate identiek alarm -> 1 episode, 1 pending, 1 alert-event",
+          inc.get("netdata:load:load_average_15") == ("active", "warning")
+          and len([p for p in pend if p[0] == "netdata:load:load_average_15"]) == 1
+          and len([e for e in evs if e["fingerprint"] == "netdata:load:load_average_15"
+                   and e.get("state") == "active"]) == 1, str(pend))
+
+    # ND 5: recovery (alarm verdwijnt uit active-set na geslaagde poll)
+    inc, evs, pend, nd_sum = nd_run([[], [LOAD_W], []], {"mem_used_pct": [40]})
+    check("ND5a: recovery: alarm verdwenen -> incident resolved",
+          inc.get("netdata:load:load_average_15", ("", ""))[0] == "resolved",
+          str(inc.get("netdata:load:load_average_15")))
+    check("ND5b: recovery -> resolved-event, geen RECOVERY-pending (notifier doet herstel)",
+          any(e["fingerprint"] == "netdata:load:load_average_15"
+              and e.get("state") == "resolved" for e in evs)
+          and not any(p[0] == "netdata:load:load_average_15" and p[1] != "new"
+                      for p in pend), str(pend))
+
+    # ND 6: stale alarm (blijft onveranderd actief) -> geen reminders
+    inc, evs, pend, nd_sum = nd_run([[], [LOAD_W], [dict(LOAD_W)], [dict(LOAD_W)], [dict(LOAD_W)]],
+                            {"mem_used_pct": [40]})
+    check("ND6: stale onveranderd alarm x4 -> nog steeds 1 pending, incident intact",
+          inc.get("netdata:load:load_average_15") == ("active", "warning")
+          and len([p for p in pend if p[0] == "netdata:load:load_average_15"]) == 1, str(pend))
+
+    # ND 7: netdata tijdelijk onbereikbaar
+    inc, evs, pend, nd_sum = nd_run([[], "FAIL", "FAIL", "FAIL"], {"mem_used_pct": [40]})
+    check("ND7a: 3 mislukte polls -> availability-warning + pending",
+          inc.get("netdata:availability") == ("active", "warning")
+          and any(p[0] == "netdata:availability" and p[1] == "new" for p in pend),
+          str((inc.get("netdata:availability"),
+               [(e.get("check"), e.get("fingerprint"), e.get("reason")) for e in evs
+                if "netdata" in str(e.get("fingerprint", ""))],
+               [s.get("sev_netdata") for s in nd_sum], pend)))
+    check("ND7b: mislukte polls raken alarm-state niet (geen valse incidents)",
+          "netdata:load:load_average_15" not in inc, str(inc))
+    inc, evs, pend, nd_sum = nd_run([[], [LOAD_W], "FAIL"], {"mem_used_pct": [40]})
+    check("ND7c: poll mislukt ná actief alarm -> incident blijft actief",
+          inc.get("netdata:load:load_average_15") == ("active", "warning"),
+          str(inc.get("netdata:load:load_average_15")))
+
+    # ------------------------------------------------------------------
+    # DUMBscope centrale incident-routing (fase 9): poll-resultaten gemockt
+    # via de echte normalisatie (hermes_dumbscope.normalize_incident).
+    class _FakeDs:
+        def __init__(self, polls):
+            self.polls = list(polls)
+            self.i = 0
+
+        def poll(self, resolved_limit=20):
+            p = self.polls[self.i] if self.i < len(self.polls) else []
+            self.i += 1
+            if p == "FAIL":
+                raise _hd.DumbScopeError("unavailable", None, "test-timeout")
+            return {"ok": True, "health": {"dumb": "up"}, "incidents": list(p),
+                    "metrics": {"active_count": len(p), "payload_bytes": 1,
+                                "runtime_s": 0.0}}
+
+    def ds_inc(fp_suffix, severity="warning", status="active", occurrences=1,
+               title="Decypharr debrid mount: degraded", affected=None):
+        return _hd.normalize_incident({
+            "id": "src-" + fp_suffix, "fingerprint": "mount:" + fp_suffix,
+            "severity": severity, "status": status, "title": title,
+            "firstSeen": 1790200000000, "lastSeen": 1790208000000 + occurrences,
+            "resolvedAt": None, "occurrences": occurrences,
+            "affectedServices": affected or [], "rootCauseService": None,
+            "summary": "test", "evidence": []})
+
+    def ds_run(ds_polls, nd_polls=None):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        con = sqlite3.connect(tmp / "homelab" / "samples.db")
+        con.executescript(SAMPLES_SCHEMA)
+        con.execute("insert into samples(ts, sampler_ver, mem_used_pct) values(?,?,?)",
+                    (int(datetime.now(timezone.utc).timestamp()) - 120, 1, 40))
+        con.commit(); con.close()
+        fnd = _NoNd() if nd_polls is None else _FakeNd(nd_polls)
+        fds = _FakeDs(ds_polls)
+        old_ds, old_nd = globals()["make_client"], _hn.make_client
+        globals()["make_client"] = lambda cfg_: fds
+        _hn.make_client = lambda cfg_: fnd
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        inc, evs, pend = {}, [], []
+        try:
+            con = state_db()
+            for _ in ds_polls:
+                evs_run = []
+                run_fast(cfg, evs_run)
+                evs += evs_run
+            con.close()
+            c2 = sqlite3.connect(STATE_DB)
+            for fp, state, sev in c2.execute(
+                    "select fingerprint, state, current_severity from incidents"):
+                inc[fp] = (state, sev)
+            pend = [tuple(r) for r in c2.execute(
+                "select fingerprint, event_type, severity from pending_transitions order by id")]
+            c2.close()
+            return inc, evs, pend
+        finally:
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            globals()["make_client"] = old_ds
+            _hn.make_client = old_nd
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    FPS = "dumbscope:mount:a1"
+    inc, evs, pend = ds_run([[], [ds_inc("a1")]])
+    check("DS1: nieuw DUMBscope-warning -> centraal incident + pending",
+          inc.get(FPS) == ("active", "warning")
+          and any(p[0] == FPS and p[1] == "new" and p[2] == "warning" for p in pend)
+          and len([p for p in pend if p[0] == FPS]) == 1, str((inc.get(FPS), pend)))
+    inc, evs, pend = ds_run([[], [ds_inc("c1", severity="critical")]])
+    check("DS2: nieuw DUMBscope-critical -> centraal critical + pending",
+          inc.get("dumbscope:mount:c1") == ("active", "critical")
+          and any(p[0] == "dumbscope:mount:c1" and p[1] == "new"
+                  and p[2] == "critical" for p in pend), str((inc.get("dumbscope:mount:c1"), pend)))
+    inc, evs, pend = ds_run([[], [ds_inc("a1")],
+                              [ds_inc("a1", severity="critical", occurrences=2)]])
+    check("DS3: escalatie warning->critical -> escalated pending, geen duplicaat",
+          inc.get(FPS) == ("active", "critical")
+          and any(p[0] == FPS and p[1] == "escalated" and p[2] == "critical" for p in pend)
+          and len([p for p in pend if p[0] == FPS]) == 2, str((inc.get(FPS), pend)))
+    inc, evs, pend = ds_run([[], [ds_inc("a1")], [ds_inc("a1", occurrences=2)]])
+    check("DS4: duplicate (occurrences-only) -> geen nieuwe pending",
+          inc.get(FPS) == ("active", "warning")
+          and len([p for p in pend if p[0] == FPS]) == 1, str(pend))
+    inc, evs, pend = ds_run([[], [ds_inc("a1")],
+                             [ds_inc("a1", status="resolved", occurrences=2)]])
+    check("DS5: recovery -> centraal resolved, resolved-event, geen recovery-pending",
+          inc.get(FPS, ("", ""))[0] == "resolved"
+          and any(e["fingerprint"] == FPS and e.get("state") == "resolved" for e in evs)
+          and len([p for p in pend if p[0] == FPS]) == 1, str((inc.get(FPS), pend)))
+    inc, evs, pend = ds_run([[], [ds_inc("a1")],
+                             [ds_inc("a1", status="resolved", occurrences=2)],
+                             [ds_inc("a1", occurrences=3)]])
+    check("DS6: heropen na recovery -> reopened pending",
+          inc.get(FPS) == ("active", "warning")
+          and any(p[0] == FPS and p[1] == "reopened" for p in pend), str(pend))
+    inc, evs, pend = ds_run(
+        [[], [ds_inc("a1", affected=["DUMB"])],
+         [ds_inc("a1", affected=["DUMB"], occurrences=2)]],
+        nd_polls=[[], [],
+                  [nd_raw("docker_container_unhealthy",
+                          "docker_local.container_DUMB_health_status", "WARNING", 1.0)]])
+    check("DS7: netdata container-health + actief DUMBscope-incident -> evidence-only, 1 keten",
+          "netdata:container:DUMB" not in inc
+          and any(e["fingerprint"] == "netdata:container:DUMB"
+                  and e.get("dedup") == "covered_evidence_only" for e in evs)
+          and not any(p[0].startswith("netdata:") for p in pend), str(pend))
+
+    # ------------------------------------------------------------------
+    # Sampler-gap (fase 9): leeftijd van de laatste host-sample aan te sturen
+    # per poll (minuten); "NO_DB" = samples.db onleesbaar/afwezig.
+    def gap_run(seq):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "homelab").mkdir(parents=True)
+        old_ds, old_nd = globals()["make_client"], _hn.make_client
+        globals()["make_client"] = lambda cfg_: _NoDs()
+        _hn.make_client = lambda cfg_: _NoNd()
+        old = (HOME, SAMPLES_DB, STATE_DB, EVENTS)
+        globals().update(HOME=tmp, SAMPLES_DB=tmp / "homelab" / "samples.db",
+                         STATE_DB=tmp / "homelab" / "agent_state.db",
+                         EVENTS=tmp / "homelab" / "evaluator-events.jsonl")
+        inc, evs, pend = {}, [], []
+        try:
+            con = state_db()
+            for item in seq:
+                spath = tmp / "homelab" / "samples.db"
+                for suf in ("", "-wal", "-shm"):
+                    pp = Path(str(spath) + suf)
+                    if pp.exists():
+                        pp.unlink()
+                if item != "NO_DB":
+                    sc = sqlite3.connect(spath)
+                    sc.executescript(SAMPLES_SCHEMA)
+                    ts = int(datetime.now(timezone.utc).timestamp()) - int(item * 60)
+                    sc.execute("insert into samples(ts, sampler_ver, mem_used_pct)"
+                               " values(?,?,?)", (ts, 1, 40))
+                    sc.commit(); sc.close()
+                evs_run = []
+                run_fast(cfg, evs_run)
+                evs += evs_run
+            con.close()
+            c2 = sqlite3.connect(STATE_DB)
+            for fp, state, sev in c2.execute(
+                    "select fingerprint, state, current_severity from incidents"):
+                inc[fp] = (state, sev)
+            pend = [tuple(r) for r in c2.execute(
+                "select fingerprint, event_type, severity from pending_transitions order by id")]
+            c2.close()
+            return inc, evs, pend
+        finally:
+            globals().update(HOME=old[0], SAMPLES_DB=old[1], STATE_DB=old[2], EVENTS=old[3])
+            globals()["make_client"] = old_ds
+            _hn.make_client = old_nd
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    SFP = "hermes:sampler:stale"
+    inc, evs, pend = gap_run([5])
+    check("GAP1: sample 5 min oud -> normal, geen incident",
+          SFP not in inc, str(inc.get(SFP)))
+    inc, evs, pend = gap_run([15])
+    check("GAP2: sample 15 min oud -> warning + pending",
+          inc.get(SFP) == ("active", "warning")
+          and any(p[0] == SFP and p[1] == "new" and p[2] == "warning" for p in pend),
+          str((inc.get(SFP), pend)))
+    inc, evs, pend = gap_run([15, 45])
+    check("GAP3: 15 -> 45 min -> escalatie naar urgent",
+          inc.get(SFP) == ("active", "urgent")
+          and any(p[0] == SFP and p[1] == "escalated" and p[2] == "urgent" for p in pend),
+          str((inc.get(SFP), pend)))
+    inc, evs, pend = gap_run([15, 45, 46])
+    check("GAP4: meerdere stale polls -> geen duplicate pending",
+          inc.get(SFP) == ("active", "urgent")
+          and len([p for p in pend if p[0] == SFP]) == 2, str(pend))
+    inc, evs, pend = gap_run([15, 3])
+    check("GAP5: sampler hervat -> precies een recovery, geen recovery-pending",
+          inc.get(SFP, ("", ""))[0] == "resolved"
+          and any(e["fingerprint"] == SFP and e.get("state") == "resolved" for e in evs)
+          and len([p for p in pend if p[0] == SFP]) == 1, str((inc.get(SFP), pend)))
+    inc, evs, pend = gap_run([15, "NO_DB"])
+    check("GAP6a: DB/read-failure -> geen valse recovery",
+          inc.get(SFP) == ("active", "warning")
+          and not any(e["fingerprint"] == SFP and e.get("state") == "resolved"
+                      for e in evs), str(inc.get(SFP)))
+    inc, evs, pend = gap_run([15, "NO_DB", 46])
+    check("GAP6b: DB-failure tussen stale polls -> incident blijft bestaan",
+          inc.get(SFP) == ("active", "urgent"), str(inc.get(SFP)))
 
     fails = [r for r in results if not r[1]]
     for name, okk, detail in results:
@@ -1668,6 +3420,27 @@ def run_test(cfg):
     return 0 if not fails else 1
 
 # --------------------------------------------------------------------- main --
+def acquire_deploy_lock(timeout_s=90, poll_s=5, path=None):
+    """Fase 4 (§8): gedeelde (LOCK_SH) deploy-lock. Een evaluator-run start
+    niet tijdens een multi-file deploy; deploy.sh houdt LOCK_EX tijdens de
+    vervanging. Bounded wait: na timeout -> (None, reden) zodat cron hooguit
+    één run overslaat, nooit permanent blokkeert. Volgorde evaluator.lock ->
+    deploy.lock is overal gelijk; deploy neemt alleen deploy.lock -> geen
+    deadlock-cyclus mogelijk."""
+    import fcntl, time
+    fd = open(Path(path) if path else HL / "deploy.lock", "w")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return fd, None
+        except OSError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                return None, "deploy bezig (deploy.lock)"
+            time.sleep(poll_s)
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "fast"
     cfg = load_cfg()
@@ -1680,6 +3453,10 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("evaluator: vorige run nog actief; overgeslagen")
+        return
+    dlock, why = acquire_deploy_lock()
+    if dlock is None:
+        print(f"evaluator: {why}; run overgeslagen")
         return
     events = []
     if mode == "fast":
