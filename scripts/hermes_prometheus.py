@@ -380,19 +380,23 @@ def run_test():
           state text, current_severity text, previous_severity text, first_seen text,
           last_seen text, last_changed text, resolved_at text, occurrences integer,
           last_value real, peak_value real, last_alert_at text, suppression_until text,
-          good_samples integer, last_reason text);
+          good_samples integer, last_reason text, llm_call_count integer default 0);
         create table cursors(name text primary key, value text, last_checked text);
         create table metric_state(metric text primary key, last_value real,
           previous_value real, last_ts text, trend text, slope real, sustained_since text,
           peak real, baseline_pending integer);
+        create table pending_transitions(
+          id integer primary key autoincrement,
+          fingerprint text not null, ts text, event_type text, severity text,
+          reason text);
         """)
         con.commit()
         return tmp, con
 
     def ins(con, fp, sev="warning", state="active", value=85.0):
-        con.execute("insert or replace into incidents values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        con.execute("insert or replace into incidents values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (fp, "fast", "t", state, sev, "normal", "t", "t", "t", None, 1,
-                     value, value, "t", None, 0, "synthetic"))
+                     value, value, "t", None, 0, "synthetic", 0))
         con.commit()
 
     RAM_EXPR = EXPR["ram_pct"]

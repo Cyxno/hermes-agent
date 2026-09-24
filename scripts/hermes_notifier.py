@@ -54,6 +54,10 @@ create table if not exists notifications(
   retry_count integer default 0, last_error text, next_retry_at text,
   updated_at text);
 create table if not exists notification_meta(name text primary key, value text);
+create table if not exists pending_transitions(
+  id integer primary key autoincrement,
+  fingerprint text not null, ts text, event_type text, severity text,
+  reason text);
 """
 
 
@@ -208,6 +212,20 @@ def build_text(fp, inc, dsi, ctx, event):
         lines.append(f"RAM: {val:.0f}% used")
         if ctx.get("mem_avail_kb"):
             lines.append(f"Available: {fmt_gib(ctx['mem_avail_kb'])}")
+    if fp.startswith("disk:") and fp.endswith(":growth"):
+        # monotone-counter event: huidige teller = context, delta = het event
+        if val is not None:
+            lines.append(f"Nieuwe delta: +{int(val or 0)}")
+        if ctx.get("counter_current") is not None:
+            lines.append(f"Huidige counter: {int(ctx['counter_current'])}")
+        if ctx.get("since_change"):
+            lines.append(f"Sinds vorige verandering: {ctx['since_change']}")
+    elif fp.endswith(":growth"):
+        # groei-incidenten: last_value is een groeirate in GiB/uur — nooit als
+        # percentage tonen (veronderstelde '6%' was een verkeerd geformatteerde rate)
+        unit = " GiB/uur"
+        if val is not None:
+            lines.append(f"Groeirate: {val:.2f}{unit}")
     elif "vdisk" in fp or "logfs" in fp or \
             fp.split(':high')[0].split(':')[-1] in ("cache", "vm_storage", "user_share", "rootfs"):
         lines.append(f"Gebruikt: {val:.0f}%")
@@ -228,13 +246,17 @@ def build_text(fp, inc, dsi, ctx, event):
     else:
         if val is not None:
             lines.append(f"Waarde: {val}")
-    if dsi is None and fp not in ("dumbscope:availability",) and not fp.startswith("docker:"):
+    if dsi is None and fp not in ("dumbscope:availability",) and not fp.startswith("docker:") \
+            and not (fp.startswith("disk:") and fp.endswith(":growth")):
         if ctx.get("direction") and lvl >= 2:
             lines.append(f"Trend: {ctx['direction']}")
         if peak is not None and peak != val and lvl >= 2:
-            lines.append(f"Peak: {peak if isinstance(peak, str) else round(peak, 1)}")
+            peak_unit = " GiB/uur" if fp.endswith(":growth") else (
+                "%" if fp.endswith(":high") else (" °C" if fp.startswith("host:temperature") else ""))
+            peak_txt = peak if isinstance(peak, str) else round(peak, 1)
+            lines.append(f"Peak: {peak_txt}{peak_unit}")
     dur = human_dur(parse_ts(inc["first_seen"]), now)
-    if dur and inc["state"] != "resolved":
+    if dur and inc["state"] != "resolved" and not (fp.startswith("disk:") and fp.endswith(":growth")):
         lines.append(f"Duur: {dur}")
     elif inc["state"] == "resolved" and dur:
         lines.append(f"Duur incident: {dur}")
@@ -244,6 +266,11 @@ def build_text(fp, inc, dsi, ctx, event):
         lines.append(f"OOM nieuw: ja (+{int(ctx['oom_delta'])})")
     if inc["occurrences"] and inc["occurrences"] > 1:
         lines.append(f"Voorkomens: {inc['occurrences']}")
+    # fase 4: hypotheses/context, geen causaliteits-claim
+    if ctx.get("recent_changes"):
+        lines.append("Recent: " + "; ".join(ctx["recent_changes"])[:220])
+    if ctx.get("recurrence"):
+        lines.append(str(ctx["recurrence"])[:200])
     reason = (inc["last_reason"] or "")[:160]
     if reason:
         lines.append(f"Reden: {reason}")
@@ -267,6 +294,8 @@ def decide(inc, nrow, cfgn, now):
         return None, "resolved zonder eerdere melding of al bevestigd"
     if lvl < minl:
         return None, f"severity {sev} onder minimum"
+    if nrow and nrow["last_notified_state"] == "resolved":
+        return "new", "heropend na resolve -> direct bericht (geen cooldown)"
     if not nrow or not nrow["ever_notified"]:
         return "new", "nieuw incident"
     last_lvl = LEVELS.get(nrow["last_notified_severity"], 0)
@@ -405,6 +434,18 @@ def gather_context(samples_db, c, fp):
         r = c.execute("select delta from counters where name='oom_kills'").fetchone()
         if r:
             ctx["oom_delta"] = r[0]
+        if fp.startswith("disk:") and fp.endswith(":growth"):
+            parts = fp.split(":")
+            name = f"smart:{parts[1]}:{parts[-1].removesuffix('_growth')}"
+            r = c.execute("select current_value from counters where name=?", (name,)).fetchone()
+            if r and r[0] is not None:
+                ctx["counter_current"] = r[0]
+            t = c.execute("select value from cursors where name=?",
+                          (f"{name}:last_change",)).fetchone()
+            if t:
+                since = human_dur(parse_ts(t[0]), now_dt())
+                if since:
+                    ctx["since_change"] = since
         metric = {"host:memory:high": "mem_used_pct", "host:docker_vdisk:high": "vdisk_pct",
                   "host:logfs:high": "logfs_pct", "host:cache:high": "cache_pct",
                   "host:vm_storage:high": "vm_pct", "host:user_share:high": "user_pct",
@@ -416,7 +457,95 @@ def gather_context(samples_db, c, fp):
                 ctx["direction"] = ms[0]
     except Exception:  # noqa: BLE001
         pass
+    # fase 4: change-correlation + recurrentie — deterministisch, lokaal,
+    # 0 LLM. Alleen bereikt voor een daadwerkelijk te versturen bericht
+    # (candidate); gezonde runs komen hier nooit.
+    try:
+        import hermes_changes as hc
+        ccfg = hc.load_cfg()
+        exclude_key = fp.split(":")[1] if fp.startswith("docker:") and \
+            (":restarts" in fp or ":exited" in fp) else None
+        ch = hc.correlate(c, hc.now_iso(), exclude_key=exclude_key, cfg=ccfg)
+        if ch:
+            ctx["recent_changes"] = ch
+        rec = hc.recurrence(c, fp, label=title_for(fp, None).lower(), cfg=ccfg)
+        if rec:
+            ctx["recurrence"] = rec
+    except Exception:  # noqa: BLE001 — context is best-effort
+        pass
     return ctx
+
+
+def load_nrow(c, fp):
+    """Notificatie-state voor één fingerprint (of None)."""
+    r = c.execute("select last_notified_at, last_notified_severity, last_notified_state,"
+                  " notification_count, ever_notified, resolved_notified, pending,"
+                  " retry_count, next_retry_at, pending_json from notifications"
+                  " where fingerprint=?", (fp,)).fetchone()
+    if not r:
+        return None
+    return {"last_notified_at": r[0], "last_notified_severity": r[1],
+            "last_notified_state": r[2], "notification_count": r[3] or 0,
+            "ever_notified": r[4] or 0, "resolved_notified": r[5] or 0,
+            "pending": r[6] or 0, "retry_count": r[7] or 0, "next_retry_at": r[8],
+            "pending_json": r[9]}
+
+
+def load_dsi(c, fp):
+    """DUMBscope-context voor een fingerprint (of None)."""
+    d = c.execute("select title, severity, root_cause_service, affected_services,"
+                  " occurrences from dumbscope_incidents where fingerprint=?",
+                  (fp,)).fetchone()
+    if not d:
+        return None
+    return {"title": d[0], "severity": d[1], "root_cause": d[2],
+            "affected": json.loads(d[3]) if d[3] else [], "occurrences": d[4]}
+
+
+STALE_PENDING_S = 24 * 3600  # oudere vastgelegde transities zijn vervallen
+
+
+def run_pending_transitions(c, cfgn, now, *, samples_db_path, audit_path, token, chat,
+                            sender, events, stats, notified_this_run):
+    """Replay-veiligheid (fase 3-fix): transitie die de evaluator tijdens een
+    sample-replay heeft vastgelegd (bijv. critical dat binnen dezelfde run al
+    weer resolved raakte) hier alsnog door de policy halen. Geen eigen
+    state-machine: decide()/deliver()/dedup/cooldowns zijn precies dezelfde
+    paden als de state-pass hieronder; die ziet daarna verse last_notified_*-
+    velden en blijft door cooldowns stil (geen dubbele berichten)."""
+    rows = c.execute("select id, fingerprint, ts, event_type, severity, reason"
+                     " from pending_transitions order by id").fetchall()
+    for (pid, fp, ts, etype, sev, reason) in rows:
+        c.execute("delete from pending_transitions where id=?", (pid,))
+        if fp.startswith("notifications:"):
+            continue
+        ts_dt = parse_ts(ts)
+        if ts_dt and (now - ts_dt).total_seconds() > STALE_PENDING_S:
+            continue  # vervallen transitie (notifier lang niet gedraaid): nooit insets
+        irow = c.execute("select first_seen, occurrences, last_value, peak_value,"
+                         " last_reason from incidents where fingerprint=?", (fp,)).fetchone()
+        if irow is None:
+            stats["skipped"] += 1
+            continue
+        inc = {"fingerprint": fp, "state": "active", "current_severity": sev or "warning",
+               "first_seen": irow[0], "occurrences": irow[1] or 1, "last_value": irow[2],
+               "peak_value": irow[3], "last_reason": reason or irow[4] or ""}
+        nrow = load_nrow(c, fp)
+        event, why = decide(inc, nrow, cfgn, now)
+        if event is None:
+            stats["skipped"] += 1
+            continue
+        stats["candidates"] += 1
+        dsi = load_dsi(c, fp)
+        ctx = gather_context(samples_db_path, c, fp)
+        text = build_text(fp, inc, dsi, ctx, event)
+        ok = deliver(c, fp=fp, inc=inc, nrow=nrow, event=event, text=text, cfgn=cfgn,
+                     audit_path=audit_path, token=token, chat=chat, sender=sender,
+                     events=events)
+        if ok:
+            notified_this_run.add(fp)
+        stats["sent" if ok else "failed"] += 1
+        c.commit()
 
 
 def run_notifications(cfg=None, *, home=None, state_db_path=None, samples_db_path=None,
@@ -439,6 +568,13 @@ def run_notifications(cfg=None, *, home=None, state_db_path=None, samples_db_pat
     c = sqlite3.connect(state_db_path, timeout=10)
     c.execute("pragma busy_timeout=5000")
     ensure_schema(c)
+    # 0) tijdens replay vastgelegde transities eerst (policy identiek aan de
+    #    state-pass; daarna blijven cooldowns duplicates blokkeren)
+    notified_this_run = set()
+    run_pending_transitions(c, cfgn, now, samples_db_path=samples_db_path,
+                            audit_path=audit_path, token=token, chat=chat,
+                            sender=sender, events=events, stats=stats,
+                            notified_this_run=notified_this_run)
     rows = c.execute("select fingerprint, state, current_severity, first_seen, occurrences,"
                      " last_value, peak_value, last_reason from incidents"
                      " where state in ('active','recovering','resolved')"
@@ -449,17 +585,18 @@ def run_notifications(cfg=None, *, home=None, state_db_path=None, samples_db_pat
         inc = {"fingerprint": fp, "state": state, "current_severity": sev or "normal",
                "first_seen": first_seen, "occurrences": occ or 1, "last_value": val,
                "peak_value": peak, "last_reason": reason}
-        nrow = None
-        r = c.execute("select last_notified_at, last_notified_severity, last_notified_state,"
-                      " notification_count, ever_notified, resolved_notified, pending,"
-                      " retry_count, next_retry_at, pending_json from notifications"
-                      " where fingerprint=?", (fp,)).fetchone()
-        if r:
-            nrow = {"last_notified_at": r[0], "last_notified_severity": r[1],
-                    "last_notified_state": r[2], "notification_count": r[3] or 0,
-                    "ever_notified": r[4] or 0, "resolved_notified": r[5] or 0,
-                    "pending": r[6] or 0, "retry_count": r[7] or 0, "next_retry_at": r[8],
-                    "pending_json": r[9]}
+        if fp in notified_this_run and inc["state"] == "resolved":
+            # transitie-alert ging deze run al uit en het episode eindigde nog
+            # vóór de notifier: herstelbericht zou een directe duplicaat zijn.
+            # resolved_notified alsnog bevestigen (zelde semantiek als een
+            # gewone recovery-delivery), zodat heropennen normaal blijft werken.
+            c.execute("update notifications set resolved_notified=1,"
+                      " last_notified_state='resolved', updated_at=? where fingerprint=?",
+                      (iso(now), fp))
+            c.commit()
+            stats["skipped"] += 1
+            continue
+        nrow = load_nrow(c, fp)
         # 1) pending retry eerst (fail-safe: niet-afgeleverde meldingen blijven staan)
         if nrow and nrow["pending"] and nrow["next_retry_at"]:
             due = parse_ts(nrow["next_retry_at"])
@@ -479,13 +616,7 @@ def run_notifications(cfg=None, *, home=None, state_db_path=None, samples_db_pat
             stats["skipped"] += 1
             continue
         stats["candidates"] += 1
-        dsi = None
-        d = c.execute("select title, severity, root_cause_service, affected_services,"
-                      " occurrences from dumbscope_incidents where fingerprint=?",
-                      (fp,)).fetchone()
-        if d:
-            dsi = {"title": d[0], "severity": d[1], "root_cause": d[2],
-                   "affected": json.loads(d[3]) if d[3] else [], "occurrences": d[4]}
+        dsi = load_dsi(c, fp)
         ctx = gather_context(samples_db_path, c, fp)
         text = build_text(fp, inc, dsi, ctx, event)
         ok = deliver(c, fp=fp, inc=inc, nrow=nrow, event=event, text=text, cfgn=cfgn,
@@ -691,6 +822,89 @@ def run_test():
                       " where fingerprint='notifications:delivery'").fetchone()
     check("§11: 3 failures -> lokaal delivery-incident",
           row == ("active", "warning"), str(row))
+    con.close()
+
+    # ── replay-transities (fase 3-fix): pending_transitions door dezelfde policy ──
+    fail_mode["on"] = False  # bonus §11 liet de fail-mode aan; hier moet bezorgd worden
+    def add_pending(fp, sev, etype="new", reason="synthetic replay-transitie"):
+        con.execute("insert into pending_transitions(fingerprint, ts, event_type,"
+                    " severity, reason) values(?,?,?,?,?)",
+                    (fp, iso(now_dt()), etype, sev, reason))
+        con.commit()
+
+    # A: normal → critical → resolved binnen één replay-run
+    tmp, con = mkdb()
+    ins(con, "host:memory:high", "resolved", "normal", value=97.0)
+    add_pending("host:memory:high", "critical")
+    st, new = run(tmp, con)
+    check("A1: replay-critical -> alert bezorgd (niet gemist)",
+          len(new) == 1 and "Severity: CRITICAL" in new[0], str(new)[:140])
+    st, new = run(tmp, con)
+    check("A2: episode eindigde binnen dezelfde run -> géén apart herstelbericht (geen duplicaat)",
+          len(new) == 0, str(new))
+    st, new = run(tmp, con)
+    check("A3: geen duplicates", len(new) == 0, str(new))
+    con.close()
+
+    # B: warning-transitie -> 1 alert; identieke herhaling -> 0
+    tmp, con = mkdb()
+    ins(con, "host:memory:high", "active", "warning", value=92.0)
+    add_pending("host:memory:high", "warning")
+    st, new = run(tmp, con)
+    check("B1: nieuwe warning-transitie -> 1 bericht",
+          len(new) == 1 and "Severity: WARNING" in new[0], str(new)[:120])
+    add_pending("host:memory:high", "warning")  # duplicaat binnen cooldown-periode
+    st, new = run(tmp, con)
+    check("B2: identieke warning binnen cooldown -> 0", len(new) == 0, str(new))
+    con.close()
+
+    # C: bestaande recovery-policy onaangetast (alert eerdere run, geen pending)
+    tmp, con = mkdb()
+    ins(con, "host:memory:high", "active", "critical")
+    st, new = run(tmp, con)
+    check("C1: critical via state-pass -> 1 bericht", len(new) == 1, str(new)[:120])
+    st, new = run(tmp, con)
+    check("C2: unchanged critical binnen cooldown -> 0", len(new) == 0, str(new))
+    con.execute("update incidents set state='recovering', current_severity='warning'"
+                " where fingerprint='host:memory:high'"); con.commit()
+    st, new = run(tmp, con)
+    check("C3: recovering -> 0", len(new) == 0, str(new))
+    con.execute("update incidents set state='resolved', resolved_at=?"
+                " where fingerprint='host:memory:high'", (iso(now_dt()),)); con.commit()
+    st, new = run(tmp, con)
+    check("C4: resolved -> exact 1 herstelbericht",
+          len(new) == 1 and "opgelost" in new[0], str(new)[:120])
+    st, new = run(tmp, con)
+    check("C5: herstel bevestigd -> 0", len(new) == 0, str(new))
+    con.close()
+
+    # D: critical → resolved → critical binnen replay: dedup/reopen-gedrag
+    tmp, con = mkdb()
+    ins(con, "host:memory:high", "resolved", "normal", value=97.0)
+    add_pending("host:memory:high", "critical", "new")
+    add_pending("host:memory:high", "critical", "reopened")
+    st, new = run(tmp, con)
+    crit = [t for t in new if "Severity: CRITICAL" in t]
+    rec = [t for t in new if "opgelost" in t]
+    check("D1: dubbele critical-transitie -> precies 1 critical-alert (cooldown)",
+          len(crit) == 1, f"crit={len(crit)} new={len(new)}")
+    check("D2: herstelbericht onderdrukt (same-run) -> totaal 1 bericht",
+          len(rec) == 0 and len(new) == 1, f"rec={len(rec)} new={len(new)}")
+    st, new = run(tmp, con)
+    check("D3: geen vervolgberichten", len(new) == 0, str(new))
+    con.close()
+
+    # E: stale pending (notifier lang niet gedraaid) -> nooit insets versturen
+    tmp, con = mkdb()
+    ins(con, "host:memory:high", "resolved", "normal", value=97.0)
+    con.execute("insert into pending_transitions(fingerprint, ts, event_type, severity, reason)"
+                " values('host:memory:high', ?, 'new', 'critical', 'oud')",
+                ("2026-01-01T00:00:00+00:00",))
+    con.commit()
+    st, new = run(tmp, con)
+    check("E: stale pending-transitie > 24u -> geen bericht, rij opgeruimd",
+          len(new) == 0 and con.execute("select count(*) from pending_transitions").fetchone()[0] == 0,
+          str(new))
     con.close()
 
     fails = [r for r in results if not r[1]]

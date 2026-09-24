@@ -39,6 +39,9 @@ MAP=(
   "scripts/hermes_dumbscope.py|$HERMES_APPDATA/data/scripts/hermes_dumbscope.py|700|10000|10000"
   "scripts/hermes_notifier.py|$HERMES_APPDATA/data/scripts/hermes_notifier.py|700|10000|10000"
   "scripts/hermes_prometheus.py|$HERMES_APPDATA/data/scripts/hermes_prometheus.py|700|10000|10000"
+  "scripts/hermes_netdata.py|$HERMES_APPDATA/data/scripts/hermes_netdata.py|700|10000|10000"
+  "scripts/hermes_changes.py|$HERMES_APPDATA/data/scripts/hermes_changes.py|700|10000|10000"
+  "scripts/hermes_infinidysk.py|$HERMES_APPDATA/data/scripts/hermes_infinidysk.py|700|10000|10000"
 )
 
 pending=0; installed=0; same=0; skipped=0
