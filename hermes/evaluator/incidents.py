@@ -148,6 +148,26 @@ class IncidentEngine:
         except (TypeError, ValueError):
             return False
 
+    def _persist_signal_row(self, sig: Signal, now: float) -> None:
+        """Bounded raw-signal persistence for the noise funnel: one row per
+        fingerprint per `sample_window` seconds, plus every severity escalation."""
+        window = max(self.fast_interval, 300.0)
+        row = self.db.one(
+            "SELECT ts, severity FROM signals WHERE incident_id=? ORDER BY ts DESC LIMIT 1",
+            (sig.fingerprint,),
+        )
+        escalated = row is not None and SEVERITY_RANK.get(sig.severity, 0) > SEVERITY_RANK.get(
+            row["severity"], 0
+        )
+        if row is not None and not escalated and now - row["ts"] < window:
+            return
+        self.db.execute(
+            "INSERT INTO signals(ts, category, entity, severity, value, source, evidence, incident_id) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (now, sig.category, sig.entity, sig.severity, sig.value, sig.source,
+             json_dumps(sig.evidence[:3]), sig.fingerprint),
+        )
+
     def set_ai_summary(self, incident_id: str, summary: str) -> None:
         incident = self._incidents.get(incident_id)
         self.db.execute(
@@ -160,6 +180,7 @@ class IncidentEngine:
         if sig.kind == "recovery" and sig.cleared:
             self._explicit_recovery(sig, now)
             return
+        self._persist_signal_row(sig, now)
         incident = self._incidents.get(sig.fingerprint)
         debounce = float(self.config.get("debounce", {}).get(sig.category, 0))
         if incident is None or not incident.open:

@@ -375,3 +375,16 @@ async def test_managed_absence_from_inventory_detected(stack):
     # RETIRED-entiteiten genereren nooit een absent-signal
     assert stack["engine"].get("container_exit:DUMB") is None
     assert stack["engine"].get("container_exit:decypharr") is None
+
+
+# ---------------------------------------------------------------------------
+# noise funnel: raw signals worden begrensd persistent gemaakt
+# ---------------------------------------------------------------------------
+async def test_signal_rows_bounded_per_fingerprint(stack):
+    set_plex_unhealthy(stack["beacon"], stack["netdata"])
+    await run_cycles(stack, 6, step=60)  # 6 minuten aanhoudend unhealthy
+    rows = stack["db"].query(
+        "SELECT COUNT(*) AS n FROM signals WHERE incident_id='container_unhealthy:plex'"
+    )[0]["n"]
+    assert rows >= 1
+    assert rows <= 3, f"sustain-evidence moet begrensd worden, got {rows} rows"
