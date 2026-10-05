@@ -11,6 +11,7 @@ ENV HERMES_GIT_SHA=${GIT_SHA} \
     PIP_NO_CACHE_DIR=1
 
 # runtime deps only (kept deliberately small: aiohttp, PyYAML, pydantic)
+WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY hermes ./hermes
 RUN pip install --no-cache-dir .

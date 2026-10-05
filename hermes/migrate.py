@@ -19,7 +19,6 @@ from typing import Any
 import yaml
 
 from .log import info, warning
-from .state.db import Database
 
 
 def _parse_env(path: str) -> dict[str, str]:
@@ -46,19 +45,25 @@ def _parse_simple_yaml(path: str) -> dict:
 
 
 def _read_v1_incident_stats(legacy_home: str) -> dict:
+    """WAL-mode sqlite can refuse read-only opens on a read-only dir; copy first."""
     db_path = os.path.join(legacy_home, "homelab", "agent_state.db")
     if not os.path.exists(db_path):
         return {}
-    try:
-        conn = Database.__new__(Database)  # open read-only without migrations
-        import sqlite3
+    import shutil
+    import sqlite3
+    import tempfile
 
-        conn.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
-        conn.conn.row_factory = sqlite3.Row
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+        shutil.copy2(db_path, tmp_path)
+        conn = sqlite3.connect(tmp_path, timeout=10)
+        conn.row_factory = sqlite3.Row
         rows = conn.query("SELECT category, COUNT(*) AS n FROM incidents GROUP BY category")
         total = conn.one("SELECT COUNT(*) AS n FROM incidents")
         open_n = conn.one("SELECT COUNT(*) AS n FROM incidents WHERE state != 'RESOLVED'")
-        conn.conn.close()
+        conn.close()
+        os.unlink(tmp_path)
         return {
             "total": int(total["n"]) if total else 0,
             "open": int(open_n["n"]) if open_n else 0,
@@ -101,22 +106,24 @@ def migrate_legacy(legacy_home: str, v2_config_path: str | None, dry_run: bool =
     # never mark the agent's own infra as retired
     desired["retired"] = [e for e in desired["retired"] if e not in desired["managed"]]
 
-    # ---- threshold mapping ------------------------------------------------
+    # ---- threshold mapping (v1 live keys: *_pct naming) -------------------
     mem = thresholds.get("memory", {}) or {}
     temps = thresholds.get("temperatures", {}) or {}
     storage = thresholds.get("storage", {}) or {}
     v2_thresholds: dict[str, dict] = {}
-    if mem.get("warn"):
-        v2_thresholds["host_memory_pct"] = {"warn": mem["warn"], "crit": mem.get("critical", 95)}
-    if temps.get("package"):
-        v2_thresholds["host_package_temp_c"] = {
-            "warn": temps["package"].get("warn", 95),
-            "crit": temps["package"].get("critical", 98),
-        }
-    if storage.get("warn"):
-        v2_thresholds["storage_used_pct"] = {
-            "warn": storage["warn"], "crit": storage.get("critical", 88),
-        }
+    mem_warn = mem.get("warn_pct") or mem.get("warn")
+    mem_crit = mem.get("critical_pct") or mem.get("critical") or mem.get("urgent_pct")
+    if mem_warn:
+        v2_thresholds["host_memory_pct"] = {"warn": mem_warn, "crit": mem_crit or 95}
+    pkg = temps.get("package", {}) or {}
+    pkg_warn = pkg.get("warn_c") or pkg.get("warn")
+    pkg_crit = pkg.get("critical_c") or pkg.get("critical")
+    if pkg_warn:
+        v2_thresholds["host_package_temp_c"] = {"warn": pkg_warn, "crit": pkg_crit or 98}
+    st_warn = storage.get("warn_pct") or storage.get("warn")
+    st_crit = storage.get("critical_pct") or storage.get("critical")
+    if st_warn:
+        v2_thresholds["storage_used_pct"] = {"warn": st_warn, "crit": st_crit or 88}
 
     # ---- notification policy ----------------------------------------------
     cooldowns = notifications.get("cooldowns", {}) or {}
@@ -133,10 +140,10 @@ def migrate_legacy(legacy_home: str, v2_config_path: str | None, dry_run: bool =
         "thresholds": v2_thresholds,
         "cooldowns": first_repeat,
         "sources": {
-            "beacon": {"enabled": True, "base_url": "http://127.0.0.1:8090",
+            "beacon": {"enabled": True, "base_url": "http://192.168.1.2:8090",
                        "token": "env:BEACON_AGENT_API_TOKEN"},
-            "netdata": {"enabled": True, "base_url": "http://127.0.0.1:19999"},
-            "fallback": {"enabled": True, "prometheus_url": "http://127.0.0.1:9090",
+            "netdata": {"enabled": True, "base_url": "http://192.168.1.2:19999"},
+            "fallback": {"enabled": True, "prometheus_url": "http://192.168.1.2:9090",
                          "ssh_enabled": False},
         },
     }

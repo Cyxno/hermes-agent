@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migrate-legacy":
         from .migrate import migrate_legacy
 
-        asyncio.run(migrate_legacy(args.legacy_home, args.config, dry_run=args.dry_run))
+        migrate_legacy(args.legacy_home, args.config, dry_run=args.dry_run)
         return 0
 
     parser.error(f"onbekend commando {args.command!r}")
