@@ -272,15 +272,23 @@ class RuleEvaluator:
         return out
 
     # ------------------------------------------------------------------
+    # Beacon conditions Hermes detects natively with fusion + debounce; they
+    # are evidence in our own signals, not mirrored separately (no duplicates).
+    NATIVE_BEACON_CONDITIONS = frozenset(
+        {"container_unhealthy", "container_exited", "container_stopped"}
+    )
+
     def _beacon_issue_rules(self, state: NormalizedState, now: float) -> list[Signal]:
         """Mirror Beacon issues into signals; Beacon is the primary issue detector."""
         out: list[Signal] = []
         for issue in state.issues:
             if issue.status not in ("active",):
                 continue
+            if issue.condition in self.NATIVE_BEACON_CONDITIONS:
+                continue
             category = issue.category or "beacon_issue"
-            entity = (issue.target or {}).get("id") or issue.target.get("name") if issue.target else "host"
-            entity = str(entity or "host")
+            target = issue.target or {}
+            entity = str(target.get("name") or target.get("id") or "host")
             severity = BEACON_SEVERITY_MAP.get(issue.severity, "notice")
             if category in IMMEDIATE_BEACON_CATEGORIES and issue.severity == "critical":
                 severity = "critical"

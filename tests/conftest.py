@@ -78,7 +78,7 @@ class FakeBeacon:
 
     async def issues(self):
         await self._maybe_fail()
-        return {"issues": self.issues_data, "total": len(self.issues_data)}
+        return self.issues_data
 
     async def projects(self):
         await self._maybe_fail()

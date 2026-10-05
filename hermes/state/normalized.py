@@ -82,6 +82,7 @@ class BeaconIssue:
     category: str
     status: str
     summary: str
+    condition: str = ""
     first_seen_at: str | None = None
     last_seen_at: str | None = None
     target: dict | None = None

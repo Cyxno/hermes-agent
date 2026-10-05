@@ -231,7 +231,7 @@ class EvaluationPipeline:
             if inc.category.startswith("container_")
         }
         issue_entities = {
-            str((i.target or {}).get("id") or "")
+            str((i.target or {}).get("name") or (i.target or {}).get("id") or "")
             for i in state.issues if i.target
         }
         candidates = list(active_entities | issue_entities)

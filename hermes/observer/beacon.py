@@ -306,6 +306,7 @@ def parse_beacon_issue(raw: dict) -> BeaconIssue:
         category=str(raw.get("category", "issue")),
         status=str(raw.get("status", "active")),
         summary=str(raw.get("summary", "")),
+        condition=str(raw.get("condition", "")),
         first_seen_at=raw.get("firstSeenAt"),
         last_seen_at=raw.get("lastSeenAt"),
         target=raw.get("target"),

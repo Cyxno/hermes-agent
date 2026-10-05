@@ -331,3 +331,30 @@ async def test_immediate_critical_array_stopped(stack):
     assert incident.state in ("CONFIRMED", "ACTIVE")
     kinds = [k for k, _ in stack["notifier"].delivered]
     assert "alert" in kinds
+
+
+# ---------------------------------------------------------------------------
+# Beacon issue dedup: native conditions are evidence, not mirrored twice
+# ---------------------------------------------------------------------------
+async def test_beacon_native_conditions_not_mirrored(stack):
+    stack["beacon"].issues_data = [{
+        "id": "docker:plexdb-ro:unhealthy", "severity": "critical", "category": "docker",
+        "status": "active", "condition": "container_unhealthy",
+        "summary": "Container plexdb-ro reports unhealthy",
+        "target": {"type": "container", "id": "62f688e788bd", "name": "plexdb-ro"},
+    }]
+    # plexdb-ro is NOT managed/monitored by name in desired state; the native
+    # fusion rule produces at most its own signal, never a beacon_docker:<hash>
+    await run_cycles(stack, 3, step=60)
+    ids = {i.id for i in stack["engine"].open_incidents()}
+    assert not [i for i in ids if i.startswith("beacon_docker:")], "no hash duplicates"
+    # a non-native condition (updates) IS mirrored, with the container name
+    stack["beacon"].issues_data = [{
+        "id": "docker:mysql:high_risk_update", "severity": "warning", "category": "updates",
+        "status": "active", "condition": "high_risk_update_available",
+        "summary": "HIGH-risk container mysql has an update available",
+        "target": {"type": "container", "id": "eed5c014674c", "name": "mysql"},
+    }]
+    await run_cycles(stack, 3, step=60)
+    ids = {i.id for i in stack["engine"].open_incidents()}
+    assert "beacon_updates:mysql" in ids  # readable name, not image-hash
