@@ -98,7 +98,7 @@ def migrate_legacy(legacy_home: str, v2_config_path: str | None, dry_run: bool =
     v1_thresholds = thresholds.get("docker_daemon", {}) or {}
     known_stopped = v1_thresholds.get("known_stopped", []) or []
     desired = {
-        "managed": ["plex", "sonarr", "radarr", "postgres", "immich_server", "netdata"],
+        "managed": ["plex", "sonarr", "radarr", "immich_server", "netdata"],
         "retired": sorted(set(known_stopped) | {"DUMB", "decypharr"}),
         "optional": [],
         "ignored": [],

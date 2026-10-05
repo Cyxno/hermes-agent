@@ -172,6 +172,21 @@ class RuleEvaluator:
                         evidence=evidence,
                     )
                 )
+        # --- MANAGED services absent from the inventory entirely (spec §14) ---
+        if beacon_fresh:
+            for entity in self.desired.absence_candidates():
+                if entity not in state.containers:
+                    out.append(
+                        Signal(
+                            category="container_exit",
+                            entity=entity,
+                            severity="warning",
+                            source="beacon",
+                            ts=now,
+                            title=f"MANAGED container {entity} ontbreekt volledig in de Beacon-inventaris",
+                            evidence=[{"source": "beacon", "confirm": True, "state": "absent"}],
+                        )
+                    )
         # --- restart loops from recent docker transitions ---
         counts: dict[str, int] = {}
         for event in state.recent_events:

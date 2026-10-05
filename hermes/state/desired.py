@@ -66,6 +66,13 @@ class DesiredStateManager:
         state = self.get(entity) or self.ensure_discovered(entity)
         return state == MANAGED
 
+    def absence_candidates(self) -> list[str]:
+        """Entities whose complete absence from the inventory is an incident
+        candidate (MANAGED). Used by the rules to catch services that vanish
+        from the Beacon docker list entirely."""
+        rows = self.db.query("SELECT entity FROM desired_state WHERE state=?", (MANAGED,))
+        return [r["entity"] for r in rows]
+
     def monitored(self, entity: str) -> bool:
         """IGNORED entities produce no signals at all."""
         state = self.get(entity)

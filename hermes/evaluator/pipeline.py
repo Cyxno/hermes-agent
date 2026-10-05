@@ -338,11 +338,11 @@ class EvaluationPipeline:
                 return await self._recheck_container_unhealthy(entity, fresh)
             if category == "container_exit":
                 view = fresh.containers.get(entity)
-                if view is None:
-                    return False, f"{entity} verdwenen uit Beacon"
-                if view.is_running:
+                if view is not None and view.is_running:
                     return False, f"{entity} draait weer"
-                return True, f"{entity} nog steeds {view.state}"
+                # absent from inventory OR present-but-stopped: for a MANAGED
+                # entity the absence itself is the confirmed condition (spec §14)
+                return True, f"{entity} nog steeds afwezig/niet-draaiend"
             if category in ("container_restart_loop", "container_high_cpu",
                             "container_memory_pressure", "container_memory_leak"):
                 view = fresh.containers.get(entity)

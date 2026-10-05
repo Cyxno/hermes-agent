@@ -42,6 +42,8 @@ class FakeBeacon:
              "updateAvailable": False, "composeProject": "apps", "managementType": "compose"},
             {"name": "decypharr", "state": "running", "health": "healthy", "image": "decypharr",
              "updateAvailable": False, "composeProject": None, "managementType": "manual"},
+            {"name": "radarr", "state": "running", "health": "healthy", "image": "radarr",
+             "updateAvailable": False, "composeProject": "media", "managementType": "compose"},
         ]
         self.issues_data: list[dict] = []
         self.storage_data = {
@@ -197,7 +199,7 @@ TEST_CONFIG = {
                    "anomaly_rate": {"warn": 0.05, "crit": 0.25}},
     "hysteresis": {"default": {"clear_margin_pp": 5, "good_samples": 2},
                    "overrides": {"host_cpu_pct": {"clear_margin_pp": 15, "good_samples": 3}}},
-    "desired_state": {"managed": ["plex", "sonarr", "postgres"], "optional": [],
+    "desired_state": {"managed": ["plex", "sonarr", "radarr", "postgres"], "optional": [],
                       "retired": ["decypharr", "DUMB"], "ignored": []},
     "transients": {"window": 21600, "threshold_default": 5},
     "correlation": {"storage_window": 600, "storage_min_entities": 3},

@@ -358,3 +358,20 @@ async def test_beacon_native_conditions_not_mirrored(stack):
     await run_cycles(stack, 3, step=60)
     ids = {i.id for i in stack["engine"].open_incidents()}
     assert "beacon_updates:mysql" in ids  # readable name, not image-hash
+
+
+# ---------------------------------------------------------------------------
+# desired-state: MANAGED entity volledig verdwenen uit de inventaris
+# ---------------------------------------------------------------------------
+async def test_managed_absence_from_inventory_detected(stack):
+    # radarr is MANAGED; op de echte host bewijst de afwezige postgres-container
+    # (eerder in managed) hetzelfde gat. Simuleer verdwijning uit de inventaris.
+    stack["beacon"].docker_data = [c for c in stack["beacon"].docker_data if c["name"] != "radarr"]
+    assert stack["desired"].absent_is_incident("radarr")
+    await run_cycles(stack, 2, step=60)  # debounce 45s
+    incident = stack["engine"].get("container_exit:radarr")
+    assert incident is not None, "MANAGED entity absent from inventory must signal"
+    assert incident.severity == "warning"
+    # RETIRED-entiteiten genereren nooit een absent-signal
+    assert stack["engine"].get("container_exit:DUMB") is None
+    assert stack["engine"].get("container_exit:decypharr") is None
