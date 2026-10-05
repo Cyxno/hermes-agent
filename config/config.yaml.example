@@ -1,0 +1,125 @@
+# Hermes v2 — voorbeeldconfiguratie.
+# Kopieer naar /data/config.yaml (in het persistent volume) en vul het in.
+# Secrets NOOIT hier: gebruik `env:NAAM`-referenties en zet de waarden in de
+# container-omgeving (Unraid template) of /data/secrets.env.
+
+mode: shadow          # shadow | normal  (v2 start altijd in shadow na migratie)
+data_dir: /data
+log_level: info
+bind: 127.0.0.1       # health/diagnostics endpoint (alleen lokaal in de container)
+port: 8643
+
+sources:
+  beacon:             # PRIMAIRE bron (spec: Beacon = normalization layer)
+    enabled: true
+    base_url: http://192.168.1.2:8090
+    token: env:BEACON_AGENT_API_TOKEN   # minimaal 32 tekens; zie docs/MIGRATION.md
+  netdata:            # TWEEDE bron: throttling, iowait, await, anomaly
+    enabled: true
+    base_url: http://192.168.1.2:19999
+    ml_chart: ""      # optioneel: anomaly_detection.anomaly_rate_on_<machine-guid>
+  fallback:           # ALLEEN als Beacon onbereikbaar is (spec §5)
+    enabled: true
+    prometheus_url: http://192.168.1.2:9090
+    ssh_enabled: false          # optionele SSH read-dispatch host-summary
+    ssh_host: ""
+    ssh_key_path: ""
+    ssh_known_hosts: ""
+
+# Per-categorie bevestigingsvensters in seconden (spec §8). Band-metrics
+# (drempel-metrics) gebruiken de `sustains`-vensters hieronder; hun debounce is 0.
+debounce:
+  container_unhealthy: 90
+  container_exit: 45
+  container_restart_loop: 300
+  beacon_unavailable: 90
+  netdata_unavailable: 300
+  filesystem_readonly: 0        # immediate
+  disk_missing: 0               # immediate, high urgency
+  array_parity_fault: 0         # immediate, high urgency
+  host_unreachable: 60
+
+sustains:            # hoe lang een drempel overtreden moet zijn vóór een band opent (§9)
+  host_cpu_pct: 300
+  host_memory_pct: 300
+  host_package_temp_c: 180
+  host_iowait_pct: 180
+  container_cpu_throttle_pct: 300
+  container_mem_util_pct: 300
+  disk_await_ms: 240
+  storage_used_pct: 300
+  anomaly_rate: 600
+
+hysteresis:
+  default: {clear_margin_pp: 5, good_samples: 2}
+  overrides:
+    host_cpu_pct: {clear_margin_pp: 15, good_samples: 3}   # open >85, clear <70 (§9-voorbeeld)
+
+thresholds:
+  host_memory_pct: {warn: 90, crit: 95}
+  host_cpu_pct: {warn: 85, crit: 95}
+  host_package_temp_c: {warn: 95, crit: 98}
+  host_iowait_pct: {warn: 30, crit: 60}
+  container_cpu_throttle_pct: {warn: 25, crit: 60}
+  container_mem_util_pct: {warn: 90, crit: 97}
+  disk_await_ms: {warn: 50, crit: 200}
+  storage_used_pct: {warn: 80, crit: 88}
+  net_errors_per_s: {warn: 1, crit: 10}
+  anomaly_rate: {warn: 0.05, crit: 0.25}
+
+cooldowns:           # notificatie-beleid in minuten (first / repeat reminder)
+  warning: {first: 720, repeat: 1440}
+  urgent: {first: 240, repeat: 480}
+  critical: {first: 240, repeat: 720}
+
+transients: {window: 21600, threshold_default: 5}   # 5x transient in 6u -> pattern-incident
+correlation: {storage_window: 600, storage_min_entities: 3}
+
+desired_state:       # service lifecycle (spec §14) — persistent in de db
+  managed: [plex, sonarr, radarr, postgres, immich_server, netdata]
+  optional: []
+  retired: [DUMB, decypharr]     # afwezigheid is normaal
+  ignored: []
+
+ai:
+  enabled: true
+  base_url: https://openrouter.ai/api/v1
+  api_key: env:OPENROUTER_API_KEY
+  tier1_model: inclusionai/ling-3.0-flash
+  tier2_model: deepseek/deepseek-v4-flash-0731
+  confidence_stop: 0.85
+  max_calls_per_incident: 3
+  max_calls_per_day: 8
+
+executor:
+  mode: dry-run       # disabled | dry-run | guarded  (veilige default: dry-run)
+  transport: ssh-operator
+  ssh_host: ""        # leeg = geen transport; v2 mount bewust GEEN docker.sock
+  ssh_key_path: ""
+  ssh_known_hosts: ""
+  max_attempts_per_incident: 2
+  approval_ttl: 600   # scoped goedkeuring ("los het op") geldt 10 min, eenmalig
+
+telegram:
+  enabled: true
+  bot_token: env:TELEGRAM_BOT_TOKEN
+  home_chat_id: env:TELEGRAM_HOME_CHAT_ID
+  debug_chat_id: ""   # optioneel apart (debug)kanaal in shadow mode
+  allowed_usernames: [remco]
+  allowed_chat_ids: []
+  min_severity: warning     # notice wordt NOOIT verzonden
+  notify_recovery: true     # recovery alleen na eerdere alert (afgedwongen)
+  daily_summary_hour: 8
+  poll_timeout: 50
+
+scheduler:
+  fast_interval: 60       # Beacon summary/issues/docker + SSE events
+  reconcile_interval: 300 # docker/storage/system/issues + netdata-enzymes
+  baseline_interval: 900  # baselines/trends
+  daily_hour: 4           # onderhoud + retentie (UTC)
+
+retention:
+  signals_days: 14
+  transients_days: 14
+  incidents_days: 90
+  audit_days: 180

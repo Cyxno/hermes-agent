@@ -1,0 +1,31 @@
+# Referentie-deployment (de prod-installatie gebruikt de Unraid CA-template).
+# Veilige defaults: shadow mode + dry-run executor, geen docker.sock, geen
+# privileged, state in /data volume, healthcheck intern.
+services:
+  hermes:
+    image: ghcr.io/cyxno/hermes-agent:latest
+    container_name: hermes-v2
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Amsterdam
+      HERMES_MODE: shadow
+      HERMES_EXECUTOR_MODE: dry-run
+      BEACON_AGENT_API_TOKEN: ${BEACON_AGENT_API_TOKEN:?zet token in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_HOME_CHAT_ID: ${TELEGRAM_HOME_CHAT_ID:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - /mnt/user/appdata/hermes-v2/data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8643/health',timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
