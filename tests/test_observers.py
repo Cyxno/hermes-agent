@@ -133,9 +133,15 @@ async def test_netdata_container_health_states():
             if "plexdb-ro" in url:
                 return 200, {"labels": ["time", "unhealthy", "healthy"],
                              "data": [[9, 1, 0], [8, 1, 0]]}
+            if "watchtower" in url:
+                return 200, {"labels": ["time", "unhealthy", "healthy", "not_running_unhealthy"],
+                             "data": [[9, 0, 0, 1], [8, 0, 0, 1]]}
             return 404, None
 
     client = NetdataClient(http=HealthHttp(), base_url="http://n")
     assert await client.container_health("sonarr") == 1
     assert await client.container_health("plexdb-ro") == 0
+    # a stopped container reporting not_running_unhealthy is NOT an anomaly:
+    # lifecycle is Beacon's domain (validation finding 2026-10-06)
+    assert await client.container_health("watchtower") is None
     assert await client.container_health("unknown") is None

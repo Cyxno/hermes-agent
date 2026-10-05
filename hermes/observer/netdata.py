@@ -84,7 +84,14 @@ class NetdataClient:
 
     # -- typed convenience queries --------------------------------------
     async def container_health(self, container: str) -> int | None:
-        """1 = healthy, 0 = unhealthy/not_running_unhealthy, None = unknown."""
+        """1 = healthy, 0 = unhealthy while running, None = unknown/not running.
+
+        `not_running_unhealthy` is deliberately None: a stopped container's last
+        health state is meaningless for anomaly detection — container presence
+        and lifecycle are Beacon's domain (desired state), and counting it here
+        manufactured false unhealthy-flapping transients for retired/exited
+        containers (validated 2026-10-06).
+        """
         chart = f"docker_local.container_{container}_health_status"
         if not await self.chart_exists(chart):
             return None
@@ -100,7 +107,7 @@ class NetdataClient:
         if "unhealthy" in idx and float(latest[idx["unhealthy"]]) > 0:
             return 0
         if "not_running_unhealthy" in idx and float(latest[idx["not_running_unhealthy"]]) > 0:
-            return 0
+            return None  # stopped: lifecycle territory, not a health anomaly
         if "healthy" in idx and float(latest[idx["healthy"]]) > 0:
             return 1
         return None
