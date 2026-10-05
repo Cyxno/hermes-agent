@@ -74,7 +74,7 @@ class Diagnostics:
             return CheckResult("dependencies_healthy", False, f"projectgenoten niet gezond: {', '.join(bad)}")
         return CheckResult("dependencies_healthy", True, f"project {project}: alle genoten draaien")
 
-    async def check_storage_healthy(self) -> CheckResult:
+    async def check_storage_healthy(self, entity: str = "") -> CheckResult:
         breached = [
             (m, b) for m, b in self._active_bands()
             if m.startswith("disk_await_ms") or m.startswith("storage_used_pct")
@@ -84,7 +84,7 @@ class Diagnostics:
             return CheckResult("storage_healthy", False, f"storage-band actief: {names}")
         return CheckResult("storage_healthy", True)
 
-    async def check_network_healthy(self, entity: str) -> CheckResult:
+    async def check_network_healthy(self, entity: str = "") -> CheckResult:
         breached = [m for m, _ in self._active_bands() if m.startswith("net_errors")]
         if breached:
             return CheckResult("network_healthy", False, f"netwerk-fouten actief: {', '.join(breached)}")

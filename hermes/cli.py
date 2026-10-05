@@ -84,9 +84,11 @@ def main(argv: list[str] | None = None) -> int:
             app.policy.mode = "dry-run"
 
         async def _run():
+            await app.wire_http()
             result = await app.runbooks.run(incident)
             print(f"outcome={result.outcome} runbook={result.runbook}")
             print(result.detail)
+            await app.session.close()
 
         asyncio.run(_run())
         app.db.close()

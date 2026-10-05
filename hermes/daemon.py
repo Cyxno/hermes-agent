@@ -381,27 +381,32 @@ class HermesApp:
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
-    async def start(self) -> None:
+    async def wire_http(self) -> None:
+        """Create the shared session and attach it to every observer + the SSE
+        stream object (without starting loops). Used by start() and by one-shot
+        CLI paths that need live observers (runbook, once)."""
         self.session = aiohttp.ClientSession()
         port = AiohttpPort(self.session)
         if self.beacon is not None:
             self.beacon.http = port
             stream_port = StreamingHttpPort(self.session)
-
-            def on_stamp(kind: str) -> None:
-                self.metrics.sse_status = kind
-
-            self.stream = BeaconStream(
-                http=port, base_url=self.cfg.section("sources.beacon")["base_url"],
-                token=str(self.cfg.section("sources.beacon")["token"] or ""),
-                sse_reader=stream_port.sse_reader, on_stamp=on_stamp,
-            )
-            self.pipeline.stream = self.stream
-            asyncio.create_task(self.stream.run(self.clock))
+            if self.stream is None:
+                self.stream = BeaconStream(
+                    http=port, base_url=self.cfg.section("sources.beacon")["base_url"],
+                    token=str(self.cfg.section("sources.beacon")["token"] or ""),
+                    sse_reader=stream_port.sse_reader,
+                )
+                self.pipeline.stream = self.stream
         if self.netdata is not None:
             self.netdata.http = port
         if self.fallback is not None:
             self.fallback.http = port
+
+    async def start(self) -> None:
+        await self.wire_http()
+        if self.beacon is not None and self.stream is not None:
+            self.stream.on_stamp = lambda kind: setattr(self.metrics, "sse_status", kind)
+            asyncio.create_task(self.stream.run(self.clock))
         sched = self.cfg.section("scheduler")
         self._tasks = [
             asyncio.create_task(self._loop("fast", float(sched["fast_interval"]), lambda: self.cycle("fast"))),
