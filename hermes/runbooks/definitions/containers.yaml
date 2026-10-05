@@ -1,0 +1,98 @@
+# Runbook definitions — container lifecycle (spec §21/§22).
+# Deterministic: preconditions + diagnose checks gate every action.
+container_unhealthy:
+  description: >
+    Container draait maar rapporteert unhealthy. Diagnoseert dependencies,
+    storage en netwerk; herstart alleen wanneer alles elders gezond is en er
+    geen update/restart-loop speelt.
+  detect: [container_unhealthy]
+  possible_causes:
+    - interne applicatiefout of deadlock
+    - dependency (database/backup-service) ongezond
+    - storage- of netwerkdegradatie
+    - update wacht op herstart
+  preconditions: [container_exists, not_restart_looping, no_active_update]
+  diagnose: [dependencies_healthy, storage_healthy, network_healthy]
+  actions:
+    - capability: docker.restart
+  verification: [container_running, container_healthy]
+  settle_seconds: 90
+  escalation_criteria: [action_failed, verification_failed]
+
+container_exit:
+  description: >
+    Managed container draait niet. Start hem alleen als dependencies en storage
+    gezond zijn; anders is de oorzaak elders en is herstart symptoombestrijding.
+  detect: [container_exit]
+  possible_causes:
+    - crash/OOM
+    - handmatig gestopt zonder desired-state update
+    - dependency-storage weg
+  preconditions: [container_exists, not_restart_looping, no_active_update]
+  diagnose: [dependencies_healthy, storage_healthy]
+  actions:
+    - capability: docker.start
+  verification: [container_running, container_healthy]
+  settle_seconds: 120
+  escalation_criteria: [action_failed, verification_failed]
+
+container_restart_loop:
+  description: >
+    Container herstart herhaaldelijk binnen het venster. Bewust GEEN herstart:
+    die voedt de loop. Diagnose-only, escaleert naar AI/mens met bewijs.
+  detect: [container_restart_loop]
+  possible_causes:
+    - crash-loop door config-fout
+    - dependency faalt bij opstart
+    - resource-limiet (OOM)
+  preconditions: [container_exists]
+  diagnose: [dependencies_healthy, storage_healthy]
+  actions: []
+  verification: []
+  escalation_criteria: [action_failed, verification_failed]
+
+container_high_cpu:
+  description: >
+    Aanhoudend hoge CPU-throttling. Diagnose-only: automatische herstart lost
+    dit zelden veilig op; AI/ mens krijgt compacte evidence.
+  detect: [container_cpu_throttle_pct, container_high_cpu]
+  possible_causes:
+    - runaways proces in de container
+    - CPU-limiet te laag gezet
+    - externe load (backups, scrapers)
+  preconditions: [container_exists]
+  diagnose: [storage_healthy, network_healthy]
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+container_memory_pressure:
+  description: >
+    Container tegen zijn geheugenlimiet. Diagnose-only; OOM-risico wordt
+    gerapporteerd met baseline-context.
+  detect: [container_mem_util_pct, container_memory_pressure]
+  possible_causes:
+    - werklastpiek
+    - limiet te krap
+    - memory leak
+  preconditions: [container_exists]
+  diagnose: [memory_leak_trend]
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+container_memory_leak:
+  description: >
+    Geheugen groeit structureel boven baseline. Diagnoseert lekkage-trend;
+    herstart alleen als trend bewezen is en container managed is.
+  detect: [container_memory_leak]
+  possible_causes:
+    - memory leak in applicatie
+    - cache-groei zonder grens
+  preconditions: [container_exists, not_restart_looping]
+  diagnose: [memory_leak_trend]
+  actions:
+    - capability: docker.restart
+  verification: [container_running, container_healthy]
+  settle_seconds: 120
+  escalation_criteria: [action_failed, verification_failed]

@@ -1,0 +1,73 @@
+# Runbook definitions — infrastructure & observability (spec §21).
+storage_latency:
+  description: >
+    Disk-await of iowait-band actief. Altijd diagnose-only: de oorzaak zit in
+    werklast of hardware, niet in één container. Correlatie genereert het
+    root-incident; dit runbook levert bewijs aan AI/mens.
+  detect: [disk_await_ms, host_iowait_pct]
+  possible_causes:
+    - zware IO-worklast (backups, parity check, scraper)
+    - falende schijf (zie SMART via Beacon issues)
+    - cache-pool vol of fragmentatie
+  preconditions: []
+  diagnose: []
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+filesystem_readonly:
+  description: >
+    Read-only filesystem. NOOIT automatisch handelen; direct mens escaleren.
+  detect: [filesystem_readonly]
+  possible_causes:
+    - fs-fout; array in beschermde modus
+    - hardware-fout
+  preconditions: []
+  diagnose: []
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+network_packet_loss:
+  description: >
+    Netwerk-fouten of drops. Diagnose-only met interface-evidence.
+  detect: [net_errors_per_s]
+  possible_causes:
+    - kabel/NIC-probleem
+    - driver of bridge-issue
+    - externe netwerkstorung
+  preconditions: []
+  diagnose: []
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+beacon_unavailable:
+  description: >
+    Beacon onbereikbaar terwijl de host via fallback reageert. Diagnosticeert
+    of Beacon zelf of de koppeling het probleem is; geen automatische acties
+    op Beacon (Beacon is infrastructuur, geen managed service van Hermes).
+  detect: [beacon_unavailable, beacon_stale]
+  possible_causes:
+    - beacon-container gestopt of herstartend
+    - netwerk/proxy-probleem
+    - Agent API uitgeschakeld (config)
+  preconditions: []
+  diagnose: []
+  actions: []
+  verification: []
+  escalation_criteria: []
+
+netdata_unavailable:
+  description: >
+    Netdata onbereikbaar. Hermes gaat door met alleen Beacon en markeert
+    observability degraded; diagnose-only.
+  detect: [netdata_unavailable]
+  possible_causes:
+    - netdata-container gestopt
+    - poort/configwijziging
+  preconditions: []
+  diagnose: []
+  actions: []
+  verification: []
+  escalation_criteria: []
