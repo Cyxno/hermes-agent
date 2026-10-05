@@ -77,7 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "host_cpu_pct": 300,
         "host_memory_pct": 300,
         "host_load5_per_core": 300,
-        "host_package_temp_c": 180,
+        "host_package_temp_c": 600,
         "host_iowait_pct": 180,
         "container_cpu_throttle_pct": 300,
         "container_mem_util_pct": 300,

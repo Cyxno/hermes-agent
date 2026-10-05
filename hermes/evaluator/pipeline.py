@@ -174,6 +174,15 @@ class EvaluationPipeline:
         storage = data.get("storage") or {}
         host.array_state = storage.get("arrayState")
         host.parity_status = storage.get("parityStatus")
+        # storage pressure (spec §5/§8): array capacity + per-disk used %
+        capacity = storage.get("capacity") or {}
+        if capacity.get("totalBytes"):
+            try:
+                host.storage_used_pct["user"] = round(
+                    capacity["usedBytes"] / capacity["totalBytes"] * 100, 1
+                )
+            except (TypeError, ZeroDivisionError):
+                pass
         for disk in storage.get("disks") or []:
             from ..state.normalized import DiskView
 
@@ -185,6 +194,9 @@ class EvaluationPipeline:
                     temp_c=disk.get("temperatureC"),
                 )
             )
+            size, used = disk.get("sizeBytes"), disk.get("usedBytes")
+            if isinstance(size, (int, float)) and size and isinstance(used, (int, float)):
+                host.storage_used_pct[str(disk.get("name", ""))] = round(used / size * 100, 1)
         system = data.get("system") or {}
         temps = system.get("temperatures") or {}
         if host.package_temp_c is None and isinstance(temps, dict):
@@ -354,8 +366,11 @@ class EvaluationPipeline:
                     return True, "conditie nog actief"
                 return False, f"{entity} gezond in verse state"
             if category in ("host_memory_pct", "host_cpu_pct", "host_load5_per_core",
-                            "host_package_temp_c", "storage_used_pct"):
+                            "host_package_temp_c"):
                 return self._recheck_host_band(incident, fresh)
+            if category == "storage_used_pct":
+                fresh_storage = await self._fresh_beacon(storage=True)
+                return self._recheck_host_band(incident, fresh_storage)
             if category == "host_iowait_pct":
                 if self.netdata is None:
                     return True, "netdata onbeschikbaar; conditie onverifieerbaar (behouden)"

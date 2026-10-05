@@ -42,7 +42,7 @@ debounce:
 sustains:            # hoe lang een drempel overtreden moet zijn vóór een band opent (§9)
   host_cpu_pct: 300
   host_memory_pct: 300
-  host_package_temp_c: 180
+  host_package_temp_c: 600
   host_iowait_pct: 180
   container_cpu_throttle_pct: 300
   container_mem_util_pct: 300

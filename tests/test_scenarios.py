@@ -388,3 +388,19 @@ async def test_signal_rows_bounded_per_fingerprint(stack):
     )[0]["n"]
     assert rows >= 1
     assert rows <= 3, f"sustain-evidence moet begrensd worden, got {rows} rows"
+
+
+# ---------------------------------------------------------------------------
+# storage pressure: Beacon capacity/disks voeden de storage_used_pct band
+# ---------------------------------------------------------------------------
+async def test_storage_pressure_band_from_beacon(stack):
+    # 62% normaal -> geen signaal; >88% (crit) na sustain -> incident
+    total = 15 * 1024**3
+    stack["beacon"].storage_data["capacity"] = {"usedBytes": int(0.62 * total), "totalBytes": total}
+    stack["beacon"].storage_data["disks"][0]["sizeBytes"] = total // 5
+    stack["beacon"].storage_data["disks"][0]["usedBytes"] = int(0.4 * total // 5)
+    await run_cycles(stack, 2, step=60, kind="reconcile")
+    assert stack["bands"].active_band("storage_used_pct:mount:user") in ("ok", "pending")
+    stack["beacon"].storage_data["capacity"]["usedBytes"] = int(0.91 * total)
+    await run_cycles(stack, 6, step=60, kind="reconcile")  # sustain 300s
+    assert stack["bands"].active_band("storage_used_pct:mount:user") in ("warning", "critical")
