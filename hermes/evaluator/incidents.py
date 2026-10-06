@@ -388,7 +388,7 @@ class IncidentEngine:
             "INSERT OR REPLACE INTO incidents(id, category, entity, title, severity, state, first_seen, "
             "last_seen, confirmed_at, resolved_at, notification_sent, occurrences, flap_count, "
             "last_notified_at, last_notified_severity, suppressed, root_incident, evidence, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,NULL,0,0,?,0,NULL,NULL,0,NULL,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,0,0,?,0,NULL,NULL,0,NULL,?,?)",
             (pid, incident.category, incident.entity, incident.title, incident.severity,
              incident.state, incident.first_seen, incident.last_seen, incident.confirmed_at,
              incident.occurrences, json_dumps(incident.evidence), now),
