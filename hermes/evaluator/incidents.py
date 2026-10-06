@@ -44,6 +44,7 @@ class Incident:
     last_notified_severity: str | None = None
     suppressed: bool = False
     root_incident: str | None = None
+    ai_summary: str | None = None
     evidence: list[dict] = field(default_factory=list)
     recovering_since: float | None = None  # runtime (persisted via evidence meta)
 
@@ -71,6 +72,7 @@ class Incident:
             last_notified_at=row["last_notified_at"],
             last_notified_severity=row["last_notified_severity"],
             suppressed=bool(row["suppressed"]), root_incident=row["root_incident"],
+            ai_summary=row["ai_summary"] if "ai_summary" in row.keys() else None,
             evidence=json_loads(row["evidence"], []) or [],
         )
 
@@ -174,7 +176,7 @@ class IncidentEngine:
             "UPDATE incidents SET ai_summary=? WHERE id=?", (summary[:1000], incident_id)
         )
         if incident is not None:
-            incident.ai_summary = summary  # type: ignore[attr-defined]
+            incident.ai_summary = summary
 
     def _ingest_signal(self, sig: Signal, now: float) -> None:
         if sig.kind == "recovery" and sig.cleared:
