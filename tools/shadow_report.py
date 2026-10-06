@@ -13,6 +13,11 @@ Output: markdown-rapport met:
 - v2 candidates / confirmed / suppressed / transients / cancelled
 - noise-funnel: raw signals -> notifications-worthy
 - classificatieblok voor handmatige beoordeling
+
+Soak-uitbreiding (2026-10-06): unieke fingerprints, incident-state-splits,
+pattern/root-incidenten, executor would_execute vs deny, AI per model,
+plus optionele host-reliability metrics (errors, cycle-failures, restarts,
+SSE-disconnects) die de daily wrapper via --docker-* doorgeeft.
 """
 
 from __future__ import annotations
@@ -62,18 +67,21 @@ def v2_summary(db_path: str, since: float) -> dict:
 
     incidents = q("SELECT * FROM incidents WHERE first_seen >= ?", since)
     events = q("SELECT * FROM incident_events WHERE ts >= ?", since)
-    signals = q("SELECT COUNT(*) AS n, COUNT(DISTINCT category) AS cats FROM signals WHERE ts >= ?", since)
+    signals = q("SELECT COUNT(*) AS n, COUNT(DISTINCT category) AS cats, COUNT(DISTINCT incident_id) AS fps FROM signals WHERE ts >= ?", since)
     transients = q("SELECT fingerprint, COUNT(*) AS n FROM transients WHERE ts >= ? GROUP BY fingerprint ORDER BY n DESC", since)
     notifications = q("SELECT * FROM notifications WHERE ts >= ?", since)
     audit = q("SELECT * FROM action_audit WHERE ts >= ?", since)
-    ai = q("SELECT COUNT(*) AS n FROM ai_calls WHERE ts >= ?", since)
+    ai = q("SELECT model, COUNT(*) AS n FROM ai_calls WHERE ts >= ? GROUP BY model ORDER BY n DESC", since)
 
     confirmed = [i for i in incidents if i["state"] in ("CONFIRMED", "ACTIVE", "RESOLVED") and i["confirmed_at"]]
     cancelled = [e for e in events if e["reason"] and "final recheck" in str(e["reason"])]
     suppressed = [i for i in incidents if i["suppressed"]]
     roots = [i for i in incidents if (i["category"] or "").startswith(("storage_degradation", "docker_daemon_down", "project_degradation"))]
+    patterns = [i for i in incidents if i["category"] == "transient_pattern"]
     notice_only = [i for i in confirmed if i["severity"] == "notice"]
     would_notify = [i for i in confirmed if i["severity"] in ("warning", "urgent", "critical")]
+    by_state = Counter(i["state"] for i in incidents)
+    audit_split = Counter((a["policy_decision"], a["mode"]) for a in audit)
 
     return {
         "incidents": incidents,
@@ -81,14 +89,19 @@ def v2_summary(db_path: str, since: float) -> dict:
         "cancelled_events": cancelled,
         "suppressed": suppressed,
         "roots": roots,
+        "patterns": patterns,
+        "by_state": by_state,
         "notice_only": notice_only,
         "would_notify": would_notify,
         "signal_rows": signals[0]["n"] if signals else 0,
         "signal_categories": signals[0]["cats"] if signals else 0,
+        "signal_fingerprints": signals[0]["fps"] if signals else 0,
         "transients": transients,
         "notifications": notifications,
         "audit": audit,
-        "ai_calls": ai[0]["n"] if ai else 0,
+        "audit_split": audit_split,
+        "ai_calls": sum(r["n"] for r in ai),
+        "ai_by_model": ai,
     }
 
 
@@ -97,6 +110,13 @@ def main() -> int:
     ap.add_argument("--v2-db", default="/data/hermes.db")
     ap.add_argument("--v1-notifications", default="/legacy/homelab/notifications.jsonl")
     ap.add_argument("--window-hours", type=float, default=24.0)
+    ap.add_argument("--docker-errors", type=int, help="error-level logregels in het venster (host-wrapper)")
+    ap.add_argument("--cycle-failures", type=int, help="gefaalde cycli in het venster (host-wrapper)")
+    ap.add_argument("--beacon-failures", type=int, help="cycli met beacon ok=false (host-wrapper)")
+    ap.add_argument("--netdata-failures", type=int, help="cycli met netdata ok=false (host-wrapper)")
+    ap.add_argument("--sse-disconnects", type=int, help="Beacon SSE stream errors (host-wrapper)")
+    ap.add_argument("--restarts", type=int, help="docker RestartCount (host-wrapper)")
+    ap.add_argument("--uptime-hours", type=float, help="container uptime in uren (host-wrapper)")
     args = ap.parse_args()
 
     now = time.time()
@@ -107,8 +127,21 @@ def main() -> int:
     v1_by_day = Counter(time.strftime("%Y-%m-%d", time.gmtime(r["_ts"])) for r in v1)
 
     v2 = v2_summary(args.v2_db, since)
+    v2_by_day = Counter(time.strftime("%Y-%m-%d", time.gmtime(i["first_seen"])) for i in v2["would_notify"])
 
     print(f"# Shadow-rapport (venster: {args.window_hours:.0f}u, t/m {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))})")
+    print()
+    print("## Reliability (host, venster)")
+    if args.docker_errors is not None:
+        print(f"- error-logregels: {args.docker_errors}")
+        print(f"- gefaalde cycli: {args.cycle_failures}")
+        print(f"- cycli met beacon ok=false: {args.beacon_failures}")
+        print(f"- cycli met netdata ok=false: {args.netdata_failures}")
+        print(f"- Beacon SSE disconnects: {args.sse_disconnects}")
+        print(f"- container restarts: {args.restarts}")
+        print(f"- uptime: {args.uptime_hours:.1f}u")
+    else:
+        print("- (geen host-wrapper metrics doorgegeven; draai via tools/soak_daily.sh)")
     print()
     print("## v1 productie-notificaties")
     print(f"- totaal: {len(v1)}")
@@ -119,25 +152,40 @@ def main() -> int:
         print(f"  - {fp} [{event}]: {n}")
     print()
     print("## v2 (shadow)")
-    print(f"- raw signal-rows: {v2['signal_rows']} over {v2['signal_categories']} categorieën")
-    print(f"- incidenten gezien: {len(v2['incidents'])}")
+    print(f"- raw signal-rows: {v2['signal_rows']} over {v2['signal_categories']} categorieën, {v2['signal_fingerprints']} unieke fingerprints")
+    print(f"- incidenten gezien: {len(v2['incidents'])} "
+          f"(pending: {v2['by_state'].get('PENDING', 0) + v2['by_state'].get('OBSERVED', 0)}, "
+          f"confirmed: {v2['by_state'].get('CONFIRMED', 0)}, "
+          f"active: {v2['by_state'].get('ACTIVE', 0)}, "
+          f"resolved: {v2['by_state'].get('RESOLVED', 0)})")
     print(f"- confirmed (debounce gehaald): {len(v2['confirmed'])}")
     print(f"-  ├── notice-only (nooit notificatie): {len(v2['notice_only'])}")
     print(f"-  └── notification-worthy: {len(v2['would_notify'])}")
     print(f"- suppressed door correlatie: {len(v2['suppressed'])}")
     print(f"- root-incidenten: {len(v2['roots'])}")
+    print(f"- pattern-incidenten: {len(v2['patterns'])}")
     print(f"- final-recheck cancellations: {len(v2['cancelled_events'])}")
     print(f"- transients (stil): {sum(t['n'] for t in v2['transients'])} over {len(v2['transients'])} fingerprints")
-    print(f"- AI calls: {v2['ai_calls']}")
     print(f"- executor-auditregels: {len(v2['audit'])}")
+    for (decision, mode), n in sorted(v2["audit_split"].items()):
+        print(f"  - policy={decision} mode={mode}: {n}")
+    print(f"- AI calls: {v2['ai_calls']}")
+    for row in v2["ai_by_model"]:
+        print(f"  - {row['model'] or 'onbekend'}: {row['n']}")
     print()
     print("## Noise-funnel")
     raw = v2["signal_rows"]
     worthy = len(v2["would_notify"])
     if raw:
-        print(f"- raw signals ({raw}) -> confirmed ({len(v2['confirmed'])}) -> "
-              f"notification-worthy ({worthy}): reductie {100 * (1 - worthy / raw):.1f}%")
+        print(f"- raw signals ({raw}) -> fingerprints ({v2['signal_fingerprints']}) -> "
+              f"confirmed ({len(v2['confirmed'])}) -> notification-worthy ({worthy}): reductie {100 * (1 - worthy / raw):.1f}%")
     print(f"- v1 verstuurde {len(v1)} meldingen in het venster; v2 zou er {worthy} versturen")
+    if v1:
+        print(f"- reductie t.o.v. v1: {100 * (1 - worthy / len(v1)):.1f}%")
+    print()
+    print("## Notificaties per dag")
+    for day in sorted(set(v1_by_day) | set(v2_by_day)):
+        print(f"- {day}: v1={v1_by_day.get(day, 0)} v2-hypothetisch={v2_by_day.get(day, 0)}")
     print()
     print("## Classificatie (handmatig beoordelen)")
     print("| v1 fingerprint | v2 equivalent? | classificatie |")
