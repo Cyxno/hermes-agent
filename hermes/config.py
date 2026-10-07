@@ -237,6 +237,13 @@ def _apply_env_overrides(cfg: dict) -> list[str]:
         cfg.setdefault("telegram", {})["allowed_user_ids"] = [
             u.strip() for u in allowed_ids.split(",") if u.strip()
         ]
+    real_actions = os.environ.get("HERMES_EXECUTOR_REAL_ACTIONS", "")
+    if real_actions:
+        # explicit opt-in only: anything other than a true-ish value keeps the
+        # kill switch ON (§52 — activation must stay a deliberate act)
+        cfg.setdefault("executor", {})["real_actions_enabled"] = (
+            real_actions.strip().lower() in ("1", "true", "yes", "on")
+        )
     return applied
 
 

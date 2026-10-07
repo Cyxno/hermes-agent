@@ -50,4 +50,5 @@
   <Config Name="Beacon URL" Target="HERMES_BEACON_URL" Default="http://127.0.0.1:8090" Mode="" Description="Base URL of Beacon (unraid-dashboard). Use the server LAN address (e.g. http://192.168.1.2:8090); localhost does not work from a bridge container." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Netdata URL" Target="HERMES_NETDATA_URL" Default="http://127.0.0.1:19999" Mode="" Description="Base URL of Netdata; use the LAN address (e.g. http://192.168.1.2:19999)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Prometheus URL (fallback)" Target="HERMES_PROMETHEUS_URL" Default="http://127.0.0.1:9090" Mode="" Description="Only for the minimal fallback probe when Beacon is unreachable." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Executor real actions" Target="HERMES_EXECUTOR_REAL_ACTIONS" Default="false" Mode="" Description="Master kill switch for guarded real remediation. Default false = dry-run behavior even in guarded mode. Only set true after explicit validation." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>
