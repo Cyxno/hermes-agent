@@ -191,3 +191,13 @@ async def test_investigate_then_next_notification_shows_gemini(stack):
     assert delivered
     text = format_alert(delivered[0][0], delivered[0][1])
     assert "AI gebruikt: ja — Gemini 2.5 Flash-Lite" in text
+
+
+def test_package_version_is_single_source_of_truth():
+    """2.0.1-les: hardcoded VERSION in __init__ kon uit de pas lopen."""
+    from importlib.metadata import version
+
+    from hermes import VERSION, __version__
+
+    assert VERSION == version("hermes-agent") == "2.0.1"
+    assert __version__ == VERSION
