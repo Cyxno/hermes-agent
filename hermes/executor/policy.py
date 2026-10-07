@@ -48,11 +48,24 @@ def valid_target(target: str) -> bool:
     return bool(target) and TARGET_RE.match(target) is not None
 
 
+# §C13 dependency-aware deny: the control plane itself can never be an
+# automatic remediation target, even if the config forgets a name. Covers
+# Hermes (v2 + v1 rollback container), the Beacon (unraid-dashboard) and the
+# Netdata observation source. Config protected_targets extends this set.
+CONTROL_PLANE_TARGETS = {
+    "hermes", "hermes-v2", "hermes-agent",
+    "unraid-dashboard",
+    "netdata",
+}
+
+
 class PolicyEngine:
     def __init__(self, config: dict) -> None:
         self.mode = config.get("mode", "dry-run")
         self.max_attempts = int(config.get("max_attempts_per_incident", 2))
-        self.protected_targets = {str(t) for t in config.get("protected_targets", [])}
+        self.protected_targets = CONTROL_PLANE_TARGETS | {
+            str(t) for t in config.get("protected_targets", [])
+        }
         self.cooldown_seconds = float(config.get("target_cooldown_seconds", 900))
         self.max_per_hour = int(config.get("max_attempts_per_target_hour", 3))
         self.max_per_day = int(config.get("max_attempts_per_target_day", 6))

@@ -162,7 +162,10 @@ def format_daily_summary(stats: dict) -> str:
     lines.append(f"Zelf hersteld (geen melding): {stats.get('self_healed', 0)}")
     lines.append(f"Meldingen verzonden: {stats.get('notifications_sent', 0)} (onderdrukt: {stats.get('notifications_suppressed', 0)})")
     if stats.get("remediations"):
-        lines.append(f"Autonome remediëringen: {stats.get('remediations')}")
+        lines.append(
+            f"Autonome remediëringen: {stats.get('remediations')} "
+            f"(gefaald: {stats.get('failed_remediations', 0)}, geweigerd: {stats.get('denied_actions', 0)})"
+        )
     if stats.get("ai_calls"):
         lines.append(f"AI-calls: {stats.get('ai_calls')} (escalaties: {stats.get('ai_escalations', 0)})")
     if stats.get("unresolved"):

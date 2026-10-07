@@ -129,6 +129,8 @@ class CommandHandler:
             return self._mute(parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "6")
         if cmd == "/desired":
             return self._desired(parts[1:])
+        if cmd == "/executor":
+            return self._executor_control(parts[1:], username)
         return f"Onbekend commando. {self._help()}"
 
     def _help(self) -> str:
@@ -338,3 +340,31 @@ class CommandHandler:
                 return str(exc)
             return f"{entity} → {state}"
         return "Gebruik: /desired [list|set <entity> <MANAGED|OPTIONAL|RETIRED|IGNORED>]"
+
+    def _executor_control(self, args: list[str], username: str) -> str:
+        """§E5/§26 emergency control: only 'dry-run' is supported — a one-way
+        switch to the safe state. It can never enable real execution, never
+        change capability risk classes, and is always audited."""
+        if args[:1] != ["dry-run"]:
+            return (
+                "Gebruik: /executor dry-run\n"
+                "Zet de executor onmiddellijk terug naar volledige dry-run "
+                "(kill switch aan). Heractiveren kan alleen via de config."
+            )
+        exec_cfg = self.app.cfg.section("executor")
+        previous = str(exec_cfg["mode"])
+        exec_cfg["mode"] = "dry-run"
+        if "executor" in self.app.cfg.raw:
+            self.app.cfg.raw["executor"]["mode"] = "dry-run"
+        if hasattr(self.app, "policy"):
+            self.app.policy.mode = "dry-run"
+        self.app.db.execute(
+            "INSERT INTO incident_events(incident_id, ts, from_state, to_state, reason, severity) "
+            "VALUES(?,?,?,?,?,?)",
+            ("executor:control", self.app.clock.now() if hasattr(self.app, "clock") else 0,
+             previous, "dry-run", f"emergency stop door telegram/{username}", "warning"),
+        )
+        return (
+            f"Executor: {previous} → dry-run (kill switch actief). "
+            f"Real actions zijn nu onmogelijk tot de config is hersteld."
+        )

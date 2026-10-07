@@ -284,16 +284,32 @@ class HermesApp:
         for inc in open_inc[-8:]:
             flag = " [gecorreleerd]" if inc.suppressed else ""
             lines.append(f"- {inc.severity} {inc.id} ({inc.state}){flag}")
-        # §C24: compact executor status
+        # §C24/§27: compact executor status
         exec_cfg = self.cfg.section("executor")
         exec_mode = str(exec_cfg["mode"])
-        if exec_mode == "guarded" and not exec_cfg.get("real_actions_enabled", False):
-            exec_mode = "guarded (dry-run safe: real_actions_enabled=false)"
+        real_enabled = bool(exec_cfg.get("real_actions_enabled", False))
+        if exec_mode == "guarded" and not real_enabled:
+            exec_mode = "guarded (real actions disabled)"
         day_start = now - (now % 86400)
         row = self.db.one(
             "SELECT COUNT(*) AS n FROM action_audit WHERE mode='real' AND ts >= ?", (day_start,)
         )
-        lines.append(f"Executor: {exec_mode}, real actions today: {int(row['n']) if row else 0}")
+        ok_row = self.db.one(
+            "SELECT COUNT(*) AS n FROM remediations WHERE outcome IN ('resolved','success') AND ts >= ?",
+            (day_start,),
+        )
+        fail_row = self.db.one(
+            "SELECT COUNT(*) AS n FROM remediations WHERE outcome IN ('failed','action_failed','verification_failed') AND ts >= ?",
+            (day_start,),
+        )
+        lines.append(
+            f"Executor: {exec_mode}, real actions enabled: {'yes' if real_enabled else 'no'}, "
+            f"real actions today: {int(row['n']) if row else 0}"
+        )
+        lines.append(
+            f"Remediations today: {int(ok_row['n']) if ok_row else 0} successful / "
+            f"{int(fail_row['n']) if fail_row else 0} failed"
+        )
         uptime = int(now - self.metrics.started_at)
         lines.append(f"Uptime: {uptime // 3600}h{(uptime % 3600) // 60}m, cycles: {self.metrics.cycles}")
         return "\n".join(lines)
@@ -445,6 +461,15 @@ class HermesApp:
         stats["self_healed"] = int(row["n"]) if row else 0
         row = self.db.one("SELECT COUNT(*) AS n FROM remediations WHERE ts >= ?", (day_ago,))
         stats["remediations"] = int(row["n"]) if row else 0
+        row = self.db.one(
+            "SELECT COUNT(*) AS n FROM remediations WHERE ts >= ? AND outcome IN ('failed','action_failed','verification_failed')",
+            (day_ago,),
+        )
+        stats["failed_remediations"] = int(row["n"]) if row else 0
+        row = self.db.one(
+            "SELECT COUNT(*) AS n FROM action_audit WHERE ts >= ? AND result='denied'", (day_ago,)
+        )
+        stats["denied_actions"] = int(row["n"]) if row else 0
         row = self.db.one("SELECT COUNT(*) AS n FROM ai_calls WHERE ts >= ?", (day_ago,))
         stats["ai_calls"] = int(row["n"]) if row else 0
         row = self.db.one("SELECT COUNT(*) AS n FROM ai_calls WHERE ts >= ? AND result='escalated'", (day_ago,))
@@ -501,6 +526,9 @@ class HermesApp:
 
     async def start(self) -> None:
         await self.wire_http()
+        # §19: an action left in_progress by a previous crash has an unknown
+        # outcome — label it at startup so it is never blindly repeated.
+        self.executor.classify_stale_in_progress()
         if self.beacon is not None and self.stream is not None:
             self.stream.on_stamp = lambda kind: setattr(self.metrics, "sse_status", kind)
             asyncio.create_task(self.stream.run(self.clock))

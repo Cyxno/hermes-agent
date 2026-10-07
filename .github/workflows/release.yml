@@ -26,6 +26,18 @@ jobs:
     # real tag ref so dispatch is a safe dry validation
     steps:
       - uses: actions/checkout@v4
+
+      - name: Release preflight — immutable tag policy (never move a published tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # A tag that already exists remotely must NEVER be rebuilt/re-pushed.
+          # A broken release is fixed by the next patch version (docs/RELEASE.md).
+          if git ls-remote --tags origin "refs/tags/${GITHUB_REF_NAME}" | grep -q .; then
+            echo "REFUSING: tag ${GITHUB_REF_NAME} already exists remotely (immutable tag policy)."
+            echo "Release the next patch version instead."
+            exit 1
+          fi
+
       - name: Verify tag matches version (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |

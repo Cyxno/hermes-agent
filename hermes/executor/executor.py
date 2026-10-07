@@ -160,13 +160,31 @@ class Executor:
         }
 
     def _concurrency_available(self) -> bool:
-        # best-effort check from the audit; the semaphore is the hard guarantee
+        # best-effort check from the audit; the semaphore is the hard guarantee.
+        # §19: a stale in_progress row (crash mid-flight) blocks only within the
+        # bounded window; classify_stale_in_progress() re-labels it at startup.
         row = self.db.one(
             "SELECT COUNT(*) AS n FROM action_audit WHERE mode='real' AND result='in_progress' "
             "AND ts > ?",
             (self.clock.now() - 600,),
         )
         return int(row["n"]) == 0
+
+    def classify_stale_in_progress(self) -> None:
+        """§19: at startup, an action left 'in_progress' by a crash has an
+        UNKNOWN_OUTCOME: the dispatch may or may not have happened. Label it
+        (never blindly re-executed, never counted as success) so post-startup
+        remediation can proceed while the incident's fresh state decides."""
+        row = self.db.one(
+            "SELECT COUNT(*) AS n FROM action_audit WHERE mode='real' AND result='in_progress'"
+        )
+        if row and int(row["n"]):
+            self.db.execute(
+                "UPDATE action_audit SET result='unknown_outcome' WHERE mode='real' "
+                "AND result='in_progress'"
+            )
+            warning("executor", "stale in_progress actions classified UNKNOWN_OUTCOME",
+                    count=int(row["n"]))
 
     # ------------------------------------------------------------------
     async def execute(self, plan: ActionPlan, approval_id: str | None = None) -> ExecutionResult:

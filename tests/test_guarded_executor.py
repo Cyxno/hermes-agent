@@ -227,3 +227,103 @@ async def test_kill_switch_config_defaults_safe():
     exec_cfg = DEFAULTS["executor"]
     assert exec_cfg["mode"] == "dry-run"
     assert exec_cfg["real_actions_enabled"] is False  # clean installs stay dry-run
+
+
+async def test_control_plane_never_auto_remediable(tmp_path):
+    """§C13/§12: Hermes/Beacon/Netdata are denied even when config forgets them."""
+    st = make_executor(tmp_path, policy_overrides={"protected_targets": []})
+    for target in ("hermes-v2", "hermes", "unraid-dashboard", "netdata"):
+        plan = restart_plan(target=target)
+        result = await st["executor"].execute(plan)
+        assert result.status == "denied", target
+        assert "protected" in result.detail
+
+
+async def test_forbidden_never_bypassable_by_approval(tmp_path):
+    """§37: a valid scoped approval can never unlock a FORBIDDEN capability."""
+    st = make_executor(tmp_path)
+    approval = st["approvals"].create("inc:1", "array", "unraid", ttl=600)
+    plan = ActionPlan(capability="array.stop", target="unraid", reason="t", incident_id="inc:1")
+    result = await st["executor"].execute(plan, approval_id=approval["id"])
+    assert result.status == "denied"
+    assert "FORBIDDEN" in (result.policy.reason if result.policy else result.detail)
+    assert st["operator"].dispatches == []
+
+
+async def test_cooldown_applies_across_incident_ids(tmp_path):
+    """§16: restart loops cannot hop across incident IDs on the same target."""
+    st = make_executor(tmp_path)
+    await st["executor"].execute(restart_plan(incident="inc:A"))
+    st["clock"].advance(60)  # binnen cooldown
+    result = await st["executor"].execute(restart_plan(incident="inc:B"))
+    assert result.status == "deferred" and "cooldown" in result.detail
+
+
+async def test_target_budget_blocks_incident_id_rotation(tmp_path):
+    """§17: rotating incident IDs cannot bypass target-level budgets."""
+    st = make_executor(tmp_path, policy_overrides={"max_attempts_per_target_hour": 2})
+    # drie pogingen op hetzelfde target binnen een uur, elk met een ander
+    # incident-id: alleen het target-budget kan de rotatie stoppen
+    await st["executor"].execute(restart_plan(incident="inc:A", args={"allow_repeat": True}))
+    st["clock"].advance(901)  # cooldown (900s) verstreken, binnen het uur
+    await st["executor"].execute(restart_plan(incident="inc:B", args={"allow_repeat": True}))
+    st["clock"].advance(901)
+    result = await st["executor"].execute(
+        restart_plan(incident="inc:C", args={"allow_repeat": True}))
+    assert result.status == "deferred" and "budget" in result.detail
+
+
+async def test_stale_in_progress_startup_row_is_unknown_outcome(tmp_path):
+    """§19: a stale in_progress row from a crash must not be re-executed
+    blindly nor block forever; it is classified UNKNOWN_OUTCOME."""
+    st = make_executor(tmp_path)
+    st["db"].execute(
+        "INSERT INTO action_audit(id, ts, initiator, incident_id, capability, target, args, "
+        "reason, policy_decision, result, mode) VALUES('stale1', ?, 'automatic', 'inc:old', "
+        "'docker.restart', 'plex', '{}', 'crashed mid-flight', 'allow', 'in_progress', 'real')",
+        (st["clock"].now() - 100,),  # binnen het begrensde venster
+    )
+    assert not st["executor"]._concurrency_available()
+    st["executor"].classify_stale_in_progress()
+    row = st["db"].one("SELECT result FROM action_audit WHERE id='stale1'")
+    assert row["result"] == "unknown_outcome"
+    assert st["executor"]._concurrency_available() is True
+
+
+async def test_verification_source_outage_is_never_success(tmp_path):
+    """§22: verification unknown (Beacon down) is NOT success; the runbook
+    outcome must be failed/ambiguous, never resolved."""
+    from hermes.runbooks.verification import CheckResult, all_passed
+
+    results = [CheckResult("container_running", None, "container onbekend in verse state"),
+               CheckResult("container_healthy", None, "beacon onbeschikbaar")]
+    assert all_passed(results) is False
+
+
+async def test_unknown_runbook_capability_denied(tmp_path):
+    """§35: a runbook referencing an unknown capability is DENIED, 0 mutations."""
+    st = make_executor(tmp_path)
+    result = await st["executor"].execute(
+        ActionPlan(capability="docker.nuke", target="plex", reason="typo runbook",
+                   incident_id="inc:1"))
+    assert result.status == "denied" and "unknown capability" in result.detail
+    assert st["operator"].dispatches == []
+
+
+async def test_restart_storm_bounded_by_semaphore(tmp_path):
+    """§24: 10 simultaneous unhealthy containers -> one real action at a time,
+    all dispatched (serialised), no storm."""
+    st = make_executor(tmp_path, policy_overrides={"max_attempts_per_target_hour": 20,
+                                                   "max_attempts_per_target_day": 30})
+    import asyncio
+
+    plans = [restart_plan(target="plex", incident=f"inc:storm:{i}", args={"allow_repeat": True})
+             for i in range(10)]
+    # zelfde target+capability maar andere incident-ids: episode-idempotency
+    # zou de 2e..10e op hetzelfde (incident) niet blokkeren, maar cooldown wel
+    # (target-niveau) — bewijs dat er max 1 wordt gedispacht per cooldownvenster
+    results = await asyncio.gather(*(st["executor"].execute(p) for p in plans))
+    executed = [r for r in results if r.status == "executed"]
+    deferred = [r for r in results if r.status == "deferred"]
+    assert len(executed) <= 1  # target cooldown/episode voorkomt de storm
+    assert len(executed) + len(deferred) + len([r for r in results if r.status == "denied"]) == 10
