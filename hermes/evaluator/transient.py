@@ -27,6 +27,26 @@ class TransientTracker:
             "WHERE ts > ? GROUP BY fingerprint HAVING n >= 2",
             (now - self.window,),
         )
+        counts = {row["fingerprint"]: row for row in rows}
+        # Episode-einde: een open pattern-incident hoort bij het transient-
+        # venster, niet bij het live-signaal. Zakt het aantal transients in het
+        # venster onder de drempel, dan is de episode voorbij en lost het
+        # incident af (met recovery-notificatie indien eerder gealert).
+        for incident in self.engine.open_incidents():
+            if incident.category != "transient_pattern":
+                continue
+            fp = incident.id.removeprefix("transient_pattern:")
+            row = counts.get(fp)
+            base = self.engine.get(fp)
+            if base is not None and base.open:
+                continue  # echt incident actief: patroon blijft zien
+            n = int(row["n"]) if row else 0
+            threshold = int(self.overrides.get(row["category"], self.threshold)) if row else self.threshold
+            if n < threshold:
+                self.engine.resolve_manual(
+                    incident.id,
+                    f"patroon gedempt: {n} transients in venster (< drempel {threshold})",
+                )
         for row in rows:
             fp = row["fingerprint"]
             threshold = int(self.overrides.get(row["category"], self.threshold))

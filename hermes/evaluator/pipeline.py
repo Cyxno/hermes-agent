@@ -313,6 +313,24 @@ class EvaluationPipeline:
                 # so the incident lifecycle completes and recovery stays silent (§11)
                 self.engine.mark_acknowledged(incident.id)
                 continue
+            if intent["kind"] == "resolved":
+                # Recovery draait de recheck om: verstuurd wordt pas als de
+                # conditie aantoonbaar weg is. Een pattern-incident heeft geen
+                # enkele conditie om te herchecken (episode-einde is de check).
+                if incident.category != "transient_pattern":
+                    ok, reason = await self.final_recheck(incident)
+                    if ok:
+                        cancelled += 1
+                        info("pipeline", "recovery geannuleerd: conditie terug",
+                             incident_id=incident.id, reason=reason)
+                        continue
+                if self.notifier is None:
+                    continue
+                delivered = await self.notifier.deliver("resolved", self.engine.incident_snapshot(incident))
+                if delivered:
+                    self.engine.mark_notified(incident.id, self.clock.now(), incident.severity)
+                    notified += 1
+                continue
             ok, reason = await self.final_recheck(incident)
             if not ok:
                 self.engine.mark_cancelled(incident.id, reason)
