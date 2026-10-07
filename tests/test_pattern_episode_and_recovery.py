@@ -1,12 +1,12 @@
-"""Regressie: pattern-episode storm + recovery-notificaties (soak rc.3, 2026-10-07).
+"""Regression: pattern-episode storm + recovery notifications (rc.3 soak, 2026-10-07).
 
-Drie soak-gevonden bugs:
-1. confirm_pattern deed INSERT OR REPLACE bij heropening binnen het venster en
-   resette notification_sent/last_notified_at — elke fling van plex-scraper-vfs
-   werd opnieuw een "eerste" alert (28 duplicaten in ~2,5 uur).
-2. Niemand produceerde ooit een resolved-intent: recovery-notificaties waren
-   structureel dood ondanks notify_recovery.
-3. Reminder-cooldown vermenigvuldigde config-seconden met 60.
+Three soak-found bugs:
+1. confirm_pattern did INSERT OR REPLACE on re-open within the window and
+   reset notification_sent/last_notified_at — every flap of plex-scraper-vfs
+   became a fresh "first" alert (28 duplicates in ~2.5h).
+2. Nobody ever produced a resolved intent: recovery notifications were
+   structurally dead despite notify_recovery.
+3. Reminder cooldown multiplied config minutes by 60.
 """
 
 from __future__ import annotations

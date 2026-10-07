@@ -123,7 +123,7 @@ class AIRouter:
     ) -> RouteOutcome:
         available, why = self.budget_available(incident_id)
         if not available:
-            info("ai", "analyse overgeslagen", incident_id=incident_id, reason=why)
+            info("ai", "analysis skipped", incident_id=incident_id, reason=why)
             return RouteOutcome(None, 0, None, error=why)
         context_text = context_text[: self.max_context]
         user = f"{DIAGNOSIS_INSTRUCTION}\n\nINCIDENT: {incident_id}\n\nEVIDENCE:\n{context_text}"
@@ -165,7 +165,7 @@ class AIRouter:
                     diagnosis = Diagnosis.model_validate(data)
                     parse_failed = False
                 except Exception as exc:  # noqa: BLE001 - validation failure = bad output
-                    warning("ai", "schema-validatie gefaald", tier=tier, error=sanitize(exc, 160))
+                    warning("ai", "schema validation failed", tier=tier, error=sanitize(exc, 160))
             result = "ok" if not parse_failed else "invalid_output"
             audit_ai_call(self.db, self.clock, incident_id, tier, model, "diagnose",
                           request, response, result,

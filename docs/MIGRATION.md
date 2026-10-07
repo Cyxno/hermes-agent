@@ -1,94 +1,58 @@
-# Migratie, shadow mode, cutover en rollback
+# Migration, shadow mode, cutover and rollback
 
-Status per 2026-10-05: Hermes v1 draait onaangetast als productie
-(container `hermes`, repo `/mnt/cache/src/hermes-setup`). Dit document is het
-stappenplan voor de gecontroleerde overgang naar v2 (spec §48/§60-63).
+Status 2026-10-07: Hermes v2 is the production monitoring agent (2.0.1+);
+Hermes v1 is stopped and retained as a rollback archive. This document
+describes the original controlled migration path (spec §48/§60-63) and how a
+fresh install joins the current baseline.
 
-## 0. Vereiste eenmalig: Beacon Agent API activeren
+## 0. One-time prerequisite: enable the Beacon Agent API
 
-Beacon's Agent API is momenteel uit (geen token → 403 `DISABLED`). Hermes v2
-heeft Beacon als primaire bron nodig.
+Beacon's Agent API must be enabled (no token → 403 `DISABLED`). Hermes v2
+needs Beacon as its primary source.
 
-1. Genereer een token (min. 32 tekens), bijv.:
+1. Generate a token (min. 32 chars), e.g.:
    `openssl rand -hex 24`
-2. Zet in de Unraid template `/boot/config/plugins/dockerMan/templates-user/my-unraid-dashboard.xml`
-   het veld `AGENT_API_TOKEN` (staat er al, leeg) op die waarde.
-   **Backup eerst**: `cp my-unraid-dashboard.xml my-unraid-dashboard.xml.bak-$(date +%Y%m%d-%H%M)`
-3. Recreate de `unraid-dashboard` container via de Unraid Docker-tab (Update).
-4. Verifieer: `curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8090/api/agent/v1/capabilities`
-5. Vul hetzelfde token in de Hermes v2 template (`BEACON_AGENT_API_TOKEN`).
+2. Put it in the unraid-dashboard template field `AGENT_API_TOKEN` and
+   recreate the dashboard container.
+3. Verify: `curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8090/api/agent/v1/capabilities`
+4. Put the same token in the Hermes v2 template (`BEACON_AGENT_API_TOKEN`).
 
-**Rollback**: token uit template halen → container opnieuw recreate → API is weer
-403. Geen state-verlies (Beacon slaat niets van de Agent API persistent op).
+**Rollback**: remove the token from the template → recreate → the API is
+disabled again.
 
-## 1. Installatie v2 (shadow)
+## 1. Fresh install (2.x)
 
-```bash
-# 1. template plaatsen
-cp unraid/hermes-agent.xml /boot/config/plugins/dockerMan/templates/my-Hermes-Agent.xml
-# 2. config + secrets migreren vanuit v1 (schrijft ALLEEN in het v2-datapad)
-docker run --rm -v /mnt/user/appdata/hermes-v2/data:/data -v /mnt/user/appdata/hermes/data:/legacy:ro \
-  ghcr.io/cyxno/hermes-agent:latest --config /data/config.yaml migrate-legacy --legacy-home /legacy
-#    -> /data/config.yaml (mode: shadow), /data/secrets.env (0600), migration-report.json
-# 3. secrets.env waarden in de container-env zetten (Unraid template) of:
-#    env van secrets.env in de template velden plakken
-# 4. container starten via Unraid Apps (mode=shadow, executor=dry-run)
-```
+1. Install the app from the Unraid template (`unraid/hermes-agent.xml`);
+   defaults: `HERMES_MODE=shadow`, executor `dry-run`.
+2. Fill in: `BEACON_AGENT_API_TOKEN`, `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_HOME_CHAT_ID`, optional `OPENROUTER_API_KEY`,
+   optional `HERMES_TG_ALLOWED` / `HERMES_TG_ALLOWED_USER_IDS`.
+3. Start; verify `/health` and `/diagnostics`; watch shadow behaviour
+   (nothing leaves the machine).
+4. Promote: set `HERMES_MODE=normal`. Executor stays `dry-run`.
 
-In shadow mode: volledige observatie + incidentvorming, **geen** echte meldingen
-(optioneel `debug_chat_id`), executor geforceerd droog. Legacy Hermes blijft
-draaien — **dubbele Telegram-alerts zijn onmogelijk** (v2 verstuurt niets).
+## 2. Migration from v1 (historical path)
 
-## 2. Shadow-validatie (parallel, minimaal ~1 week)
+`hermes migrate-legacy` imports the v1 `.env` values (Telegram/OpenRouter)
+into `/data/secrets.env` (0600) and maps v1 thresholds. Wire the secret values
+into the container environment; `secrets.env` itself is not read at runtime.
 
-Vergelijk dagelijks (v1: `notifications.jsonl`/`evaluator-events.jsonl` vs
-v2: `hermes.db` incidents/signals + logs):
+## 3. Cutover (done 2026-10-06)
 
-- false positives (v1 alarmeerde, v2 niet → terecht?)
-- false negatives (v2 zag het niet)
-- transient-suppressie, correlatiegroepering, AI-aantal, resource-footprint.
+- v1 scheduling disabled (cron + user.scripts), v1 container stopped,
+  restart policy `no` — rollback archive retained under
+  `/mnt/cache/appdata/hermes/` (see its `migration-backup-*/RESTORE.md`).
+- v2 promoted to `mode=normal` with executor `dry-run`.
 
-`curl http://<host>:8643` is niet extern bereikbaar; in de container:
-`wget -qO- http://127.0.0.1:8643/diagnostics`.
+## 4. Rollback to v1 (emergency only)
 
-## 3. Cutover (pas na geslaagde validatie)
+Documented in the backup's `RESTORE.md`: stop v2 → re-enable v1 cron lines
+(+ SIGHUP crond) → `docker update --restart unless-stopped hermes && docker
+start hermes`.
 
-```text
-1. freeze legacy notifications  (v1: notifications.yaml telegram.enabled=false,
-   of v1 container stoppen — kies bij voorkeur eerst alleen notificaties uit)
-2. bevestig v2 shadow-state (geen openstaande valse incidenten)
-3. v2 mode: shadow -> normal  (HERMES_MODE=normal + herstart v2)
-4. observeer één dag
-5. legacy Hermes container stoppen (niet verwijderen!)
-6. na observatieperiode: executor mode dry-run -> guarded (bewuste stap)
-7. legacy verwijderen (stap 4)
-```
+## 5. Upgrades (2.x → 2.x)
 
-Update-gedrag: v2 updaten via de normale Unraid Docker-workflow (template-tag of
-`latest`); `/data` volume behoudt state; schema-migraties draaien bij startup met
-automatische backup (`hermes.db.pre-migrate-*`).
-
-## 4. Rollback (bewezen pad)
-
-```text
-1. HERMES_MODE=shadow of container v2 stoppen
-2. v1: notificaties weer aanzetten / container starten
-3. v1 state is nooit aangeraakt door v2 (v2 schrijft alleen in /data van v2)
-```
-
-## 5. Legacy cleanup (stap 4 — alleen na bewijs)
-
-Verwijderen (met backup in `/mnt/user/appdata/hermes/legacy-archive-<datum>/`):
-
-- v1 container + compose (behoud image-tag referentie in backup)
-- `/boot/config/plugins/user.scripts/scripts/Hermes evaluator fast|deep`,
-  `Hermes host sampler`, `Docker event log` + bijbehorende cron-regels
-- `/boot/config/plugins/hermes-host-sampler.sh`, `hermes-read-dispatch.sh`
-  (alleen als v2-SSH-probe/operator ze niet meer gebruikt!), anders behouden
-- `/mnt/cache/appdata/hermes/repo` (stale tweede working copy)
-- v1 `.env`-sleutels die dood zijn: `HOMELAB_SNAPSHOT_URL`
-- stray files: `data/agent_state.db` (0-byte), `data/backfill_occurrences.py`
-
-Niet aanraken: Beacon, Netdata, Prometheus, gedeelde netwerken, andere cronjobs.
-De `go`-file DUMB-referenties (rclone-mount die op een niet-bestaande container
-wacht) zijn een aparte opschoontaak buiten Hermes-scope.
+Back up `/mnt/user/appdata/hermes-v2/data/` (hermes.db, config.yaml,
+secrets.env) → recreate the container on the new image tag → verify
+`/diagnostics` (version/GIT_SHA), DB integrity and state counts. SQLite
+schema migrations run automatically and create a `.pre-migrate` backup.

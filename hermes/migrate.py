@@ -183,7 +183,7 @@ def migrate_legacy(legacy_home: str, v2_config_path: str | None, dry_run: bool =
             os.chmod(secrets_path, stat.S_IRUSR | stat.S_IWUSR)
             report["secrets_env"] = secrets_path
         report["config_written"] = target_config
-        info("migrate", "migratie voltooid", config=target_config)
+        info("migrate", "migration complete", config=target_config)
     else:
         report["config_draft"] = config_draft
         info("migrate", "dry-run: niets weggeschreven")

@@ -1,46 +1,49 @@
-# CA / Unraid Apps — readiness checklist (status 2026-10-06)
+# CA / Unraid Apps — readiness checklist (status 2026-10-07)
 
-Verschil in één zin: de lokale DockerMan-template (`templates-user/my-Hermes-Agent.xml`)
-maakt de **draaiende container beheerbaar in de Unraid Docker-tab**; Community
-Applications-readiness vereist een **publieke, vindbare release-keten** (repo →
-GHCR → template-bron → CA-submission) zodat "Apps → zoeken → Install" werkt voor
-iedereen, met update-detectie en een schone first-install.
+One-sentence difference: the local DockerMan template
+(`templates-user/my-Hermes-Agent.xml`) makes the **running container
+manageable in the Unraid Docker tab**; Community Applications readiness
+requires a **public, discoverable release chain** (repo → GHCR → template
+source → CA submission) so that "Apps → search → Install" works for everyone,
+with update detection and a clean first install.
 
-## Audit 2026-10-06 (bij soak-freeze rc.2)
+## Audit 2026-10-06 (soak freeze rc.2) — updated 2026-10-07
 
-- **Remote ontbreekt** — de homelab-kloon (én de v1-repo) heeft géén `git remote`;
-  item 1 en de CI-workflows zijn daardoor nu onuitvoerbaar. Stap 1 is dus éerst:
-  `git remote add github <URL-van-Cyxno/hermes-agent> && git push github main`.
-- **GHCR-push werkt handmatig** — `~/.docker/config.json` heeft een geldige
-  `ghcr.io`-auth; daarom bestaat `ghcr.io/cyxno/hermes-agent:2.0.0` al zonder dat
-  er een git-tag of GitHub-release bestaat.
-- **Tag-besluit nodig bij release**: die handmatige `2.0.0`-image verschilt van
-  de soak-candidate (rc.2, zie `docs/SOAK-2026-10.md`). Advies: na een geslaagde
-  soak uitbrengen als `v2.0.1` (schone, immutable keten). `v2.0.0` opnieuw pushen
-  mag alleen vóór de eerste publieke aankondiging.
-- `release.yml`/`ci.yml` zijn inhoudelijk correct (tag==pyproject wordt
-  afgedwongen, GHCR-naming `ghcr.io/cyxno/hermes-agent`, semver+`latest`).
+- **Remote** — resolved 2026-10-06: `github` remote configured
+  (`git@github.com:Cyxno/hermes-agent.git`); main and tags are pushed.
+- **GitHub Actions** — workflows exist and are syntactically valid
+  (`ci.yml`: push/PR to main; `release.yml`: tags `v*`), but no run was ever
+  observed, including after `v2.0.0`/`v2.0.1` tag pushes. Everything points at
+  repository-level Actions being disabled; the 2.1 release process re-tests
+  this via the `v2.1.0-rc.1` tag and documents the outcome.
+- **GHCR** — works manually (`~/.docker/config.json` has valid ghcr.io auth);
+  `2.0.0`, `2.0.1`, `2.0`, `latest` and the rc tags exist.
+- **Tag decision** — v2.0.0/v2.0.1 are released; 2.1.0 introduces guarded
+  self-healing (semver: minor bump).
+- `release.yml`/`ci.yml` are content-correct (tag==pyproject enforced, GHCR
+  naming `ghcr.io/cyxno/hermes-agent`, semver + `latest`, rc tags must not
+  move `latest`).
 
 ## Checklist
 
-| # | item | status | actie |
-|---|---|---|---|
-| 1 | Repository push | ❌ lokaal alleen, géén remote geconfigureerd | `git remote add github <URL>` → `git push github main` |
-| 2 | GHCR release | ❌ | tag pushen → `release.yml` bouwt en pusht `ghcr.io/cyxno/hermes-agent:{X.Y.Z,X.Y,latest}` (tag==pyproject wordt afgedwongen); tag-versie: zie audit-advies hierboven |
-| 3 | Immutable digest | ✅ workflow | semver-tags zijn immutable; `latest` beweegt; digest in release notes vastleggen |
-| 4 | Traceability | ✅ | VERSION/GIT_SHA/BUILD_TIME in image (verifieerbaar via `hermes version` + `/diagnostics`) |
-| 5 | Template-bron | 🔶 | template staat in repo (`unraid/hermes-agent.xml`); voor CA: template moet via een publieke URL (raw.githubusercontent) of in de CA-template-repo-PR beschikbaar zijn; `Repository:`-veld wijst nu naar `:latest` |
-| 6 | CA submission | ❌ | PR/registratie bij Community Applications (template + XML-conventies checken tegen de actuele CA-conventies op submission-moment; conventies zijn niet stabiel genoeg om nu blind te codificeren) |
-| 7 | Icon/support/project URLs | ✅ | icon (selfhst CDN), support/project → GitHub-issues/repo |
-| 8 | Update-detectie | 🔶 | werkt zodra GHCR-tags bestaan; het lokaal draaiende testexemplaar gebruikt lokale tag `2.0.0-rc.2` en zal "update-check" pas vinden na release 1 |
-| 9 | Clean install | 🔶 | getest in containers/venv, niet als CA-first-install; doe één handmatige first-install-test na release (lege /data → wizard = config.example kopiëren is gedocumenteerd) |
-| 10 | Upgrade-install | ✅ ontwerp | state/config in `/data`-volume overleeft recreate; schema-migraties met automatische backup; verifiëren bij eerste echte update |
-| 11 | Persistentie | ✅ | `/data`: hermes.db + config.yaml + secrets.env (0600) |
-| 12 | Rollback | ✅ | image-tag terugdraaien = recreate op oude digest; `/data` migraties maken een `.pre-migrate`-backup dat handmatig terug te zetten is |
-| 13 | Veilige defaults | ✅ | template default `HERMES_MODE=shadow`, executor `dry-run` |
+| # | item | status | action |
+|---|------|--------|--------|
+| 1 | Repository push | ✅ | `github` remote; main + tags pushed |
+| 2 | GHCR release | ✅ (manual fallback) / ⏳ pipeline proof | tag push → `release.yml` builds/pushes `{X.Y.Z,X.Y,latest}`; see RELEASE.md |
+| 3 | Immutable digests | ✅ | semver tags immutable-by-convention; `latest` moves; digest recorded per release |
+| 4 | Traceability | ✅ | VERSION/GIT_SHA/BUILD_TIME embedded (verify via `hermes version` + `/diagnostics`) |
+| 5 | Template source | 🔶 | template lives in repo (`unraid/hermes-agent.xml`); for CA it must be reachable via a public URL (raw GitHub) or the CA template repo PR; `Repository:` field currently points to `:latest` |
+| 6 | CA submission | ❌ | PR/registration with Community Applications (validate XML conventions at submission time) |
+| 7 | Icon/support/project URLs | ✅ | icon (selfhst CDN), support/project → GitHub issues/repo |
+| 8 | Update detection | ✅ | works now that GHCR tags exist (`2.0`/`latest` channels) |
+| 9 | Clean install | ✅ | proven 2026-10-07 (isolated empty `/data`: boots, schema init, dry-run default) |
+| 10 | Upgrade install | ✅ | proven 2.0.0→2.0.1 and rc→2.0.0; `/data` survives recreates, auto schema migration + `.pre-migrate` backup |
+| 11 | Persistence | ✅ | `/data`: hermes.db + config.yaml + secrets.env (0600) |
+| 12 | Rollback | ✅ | image tag rollback = recreate on old digest; schema migrations create a `.pre-migrate` backup |
+| 13 | Safe defaults | ✅ | template defaults `HERMES_MODE=shadow`, executor `dry-run`, `real_actions_enabled=false` |
 
-## Volgorde na deze validatiefase
+## Order after this phase
 
-1. push repo → 2. tag `v2.0.0` (GHCR live) → 3. template-URL fixen (raw GitHub) →
-4. eigen first/upgrade-install testen → 5. CA-submission → 6. cutover-besluit
-(volgens `docs/MIGRATION.md`).
+1. prove Actions via `v2.1.0-rc.1` → 2. release `v2.1.0` through the pipeline
+→ 3. template URL fix (raw GitHub) → 4. first/upgrade install tests → 5. CA
+submission.

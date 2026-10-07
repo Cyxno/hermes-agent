@@ -125,7 +125,7 @@ class EvaluationPipeline:
                     if state.host.cpu_pct is not None or state.host.mem_pct is not None:
                         state.host.netdata = netdata_stamp
                 except Exception as exc:  # noqa: BLE001 - fallback mag nooit de cycle breken
-                    warning("pipeline", "netdata host-metrics gefaald", error=str(exc)[:120])
+                    warning("pipeline", "netdata host metrics failed", error=str(exc)[:120])
         else:
             netdata_stamp.disabled = True
             state.sources["netdata"] = netdata_stamp
@@ -367,7 +367,7 @@ class EvaluationPipeline:
                     ok, reason = await self.final_recheck(incident)
                     if ok:
                         cancelled += 1
-                        info("pipeline", "recovery geannuleerd: conditie terug",
+                        info("pipeline", "recovery cancelled: condition returned",
                              incident_id=incident.id, reason=reason)
                         continue
                 if self.notifier is None:
@@ -381,7 +381,7 @@ class EvaluationPipeline:
             if not ok:
                 self.engine.mark_cancelled(incident.id, reason)
                 cancelled += 1
-                info("pipeline", "notification geannuleerd door final recheck",
+                info("pipeline", "notification cancelled by final recheck",
                      incident_id=incident.id, reason=reason)
                 continue
             if self.notifier is None:
@@ -509,7 +509,7 @@ class EvaluationPipeline:
             # unknown category: keep the notification (conservative default)
             return True, "geen specifieke recheck; conditie verondersteld actief"
         except Exception as exc:  # noqa: BLE001 - recheck must never crash the cycle
-            warning("pipeline", "final recheck faalde; notificatie behouden",
+            warning("pipeline", "final recheck failed; notification kept",
                     incident_id=incident.id, error=str(exc)[:160])
             return True, f"recheck error: {str(exc)[:80]}"
 

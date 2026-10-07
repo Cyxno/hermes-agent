@@ -1,12 +1,12 @@
-"""2.0.1 quality fixes: /status host-velden, partial-cycle carry-forward en
-'AI gebruikt'-metadata.
+"""2.0.1 quality fixes: /status host fields, partial-cycle carry-forward and
+'AI used' metadata.
 
 Root causes (live audit 2026-10-07):
-- Beacon summary/system levert cpu/memory percent = null (alleen load);
-  Netdata is de secundaire bron voor host CPU/RAM.
-- array=? : Beacon storage wordt alleen op reconcile gepolld; elke cycle
-  verving last_state door een lege state, waardoor een geldige reconcile-
-  waarde bij de eerstvolgende fast cycle verdween.
+- Beacon summary/system reports cpu/memory percent = null (load only);
+  Netdata is the secondary source for host CPU/RAM percentages.
+- array=? : Beacon storage is only polled on reconcile; every cycle replaced
+  last_state with an empty state, wiping a valid reconcile value on the next
+  fast cycle.
 """
 
 from __future__ import annotations
@@ -194,10 +194,16 @@ async def test_investigate_then_next_notification_shows_gemini(stack):
 
 
 def test_package_version_is_single_source_of_truth():
-    """2.0.1-les: hardcoded VERSION in __init__ kon uit de pas lopen."""
+    """2.0.1 lesson: a hardcoded VERSION in __init__ could drift from the
+    release; pyproject is the single source of truth."""
+    import tomllib
     from importlib.metadata import version
+    from pathlib import Path
 
     from hermes import VERSION, __version__
 
-    assert VERSION == version("hermes-agent") == "2.0.1"
+    py_version = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]["version"]
+    assert VERSION == version("hermes-agent") == py_version
     assert __version__ == VERSION

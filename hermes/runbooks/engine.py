@@ -74,7 +74,7 @@ class RunbookEngine:
         self.definitions.clear()
         directory = self.definitions_dir
         if not os.path.isdir(directory):
-            warning("runbooks", "definitions-map ontbreekt", directory=directory)
+            warning("runbooks", "definitions directory missing", directory=directory)
             return
         for filename in sorted(os.listdir(directory)):
             if not filename.endswith((".yaml", ".yml")):
@@ -93,7 +93,7 @@ class RunbookEngine:
                     settle_seconds=float(spec.get("settle_seconds", 90)),
                     escalation_criteria=list(spec.get("escalation_criteria", ["action_failed", "verification_failed"])),
                 )
-        info("runbooks", "definitions geladen", count=len(self.definitions))
+        info("runbooks", "definitions loaded", count=len(self.definitions))
 
     def for_incident(self, incident) -> RunbookDef | None:  # noqa: ANN001
         return self.definitions.get(incident.category)
@@ -110,7 +110,7 @@ class RunbookEngine:
             checks.append(result)
             if result.ok is False:
                 return RunbookResult(
-                    OUTCOME_AMBIGUOUS, f"precondition {check_name} gefaald: {result.detail}",
+                    OUTCOME_AMBIGUOUS, f"precondition {check_name} failed: {result.detail}",
                     runbook.name, checks,
                 )
         for check_name in runbook.diagnose:
@@ -123,7 +123,7 @@ class RunbookEngine:
         if not runbook.actions:
             return RunbookResult(
                 OUTCOME_DIAGNOSED,
-                "diagnose voltooid; geen veilige automatische actie gedefinieerd",
+                "diagnosis complete; no safe automatic action defined",
                 runbook.name, checks,
             )
 
@@ -151,7 +151,7 @@ class RunbookEngine:
             if result.status != "executed":
                 # a successful command is not a fix; a failed one certainly isn't
                 if "action_failed" in runbook.escalation_criteria:
-                    return RunbookResult(OUTCOME_FAILED, f"actie gefaald: {result.detail}", runbook.name, checks,
+                    return RunbookResult(OUTCOME_FAILED, f"action failed: {result.detail}", runbook.name, checks,
                                          [result.audit_id or ""])
                 continue
             # settle then verify against FRESH state (spec §28)
@@ -166,9 +166,9 @@ class RunbookEngine:
             if "verification_failed" in runbook.escalation_criteria and any_failed(results):
                 detail = "; ".join(f"{r.name}: {r.detail}" for r in results if r.ok is not True)
                 self._record(incident, runbook.name, OUTCOME_FAILED, checks)
-                return RunbookResult(OUTCOME_FAILED, f"verificatie gefaald: {detail}", runbook.name, checks,
+                return RunbookResult(OUTCOME_FAILED, f"verification failed: {detail}", runbook.name, checks,
                                      [result.audit_id or ""])
-        return RunbookResult(OUTCOME_AMBIGUOUS, "acties voltooid zonder conclusie", runbook.name, checks)
+        return RunbookResult(OUTCOME_AMBIGUOUS, "actions completed without conclusion", runbook.name, checks)
 
     async def run_diagnose_only(self, incident) -> RunbookResult:  # noqa: ANN001
         """Preconditions + diagnose checks without any action (for /investigate)."""

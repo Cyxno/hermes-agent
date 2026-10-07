@@ -1,88 +1,103 @@
 # Hermes v2 — security model
 
-Threat-model pass (spec §56), samengevat. Dit document beschrijft wat AI en
-externen expliciet **niet** kunnen, en waar de Grenzen in code zitten.
+Threat-model summary (spec §56, updated for 2.1). This document describes what
+AI and outsiders explicitly **cannot** do, and where the boundaries live in code.
 
-## 1. AI heeft geen shell-authoriteit (§23/§65.7)
+## 1. AI has no shell authority (§23/§65.7)
 
-- De AI (Gemini/DeepSeek) produceert hooguit een gevalideerd `Diagnosis`-object met
-  `proposedActions` — **pydantic-gevalideerd** (`intelligence/schemas.py`):
-  capability en target mogen geen shell-metatekens bevatten (`\n\r;|&$\``).
-- Acties gaan altijd via: PolicyEngine → CapabilityGuard → Executor
-  (`executor/executor.py`). De executor is de enige component die SSH-operator-
-  acties aanmaakt, en bouwt argv **zonder shell**: elke parameter is een
-  los argv-element (`SshOperator.docker_argv`), door de dispatcher server-side
-  opnieuw gevalideerd.
-- AI-output wordt nooit uitgevoerd zonder policy-verdict; FORBIDDEN-capabilities
-  hebben **geen transport** (`dispatch_action=None`) en zijn onmogelijk uit te
-  voeren, ook niet met goedkeuring.
+- The AI (Gemini/DeepSeek) at most produces a validated `Diagnosis` object with
+  `proposedActions` — **pydantic-validated** (`intelligence/schemas.py`):
+  capability and target must not contain shell metacharacters.
+- Actions always go through: PolicyEngine → CapabilityRegistry → Executor
+  (`executor/executor.py`). The executor is the only component that builds
+  SSH-operator invocations, and builds argv **without a shell**: every
+  parameter is a discrete argv element (`SshOperator.docker_argv`), re-validated
+  server-side by the dispatcher.
+- AI output is never executed without a policy verdict; FORBIDDEN capabilities
+  have **no transport** (`dispatch_action=None`) and can never execute, even
+  with approval.
+- AI `proposedActions` are advisory: they are surfaced in `/investigate` output
+  and audits, but only deterministic runbooks can produce an `ActionPlan`.
 
-## 2. Logdata is untrusted input
+## 2. Log data is untrusted input
 
-- `ContextBuilder._log_section` plaatst logregels expliciet tussen
-  `<<<BEGIN_LOGDATA / END_LOGDATA>>>` markers met een systeemprompt-instructie
-  dat inhoud data is, nooit instructies (getest:
+- `ContextBuilder._log_section` wraps log lines in explicit
+  `<<<BEGIN_LOGDATA / END_LOGDATA>>>` markers with a system-prompt instruction
+  that the content is data, never instructions (tested:
   `test_context_builder_fences_log_content`).
-- Alles dat naar logs/Telegram gaat, gaat door `util.sanitize` (token/key-
-  patterns worden gemaskeerd, lengte begrensd).
+- Everything that reaches logs/Telegram passes through `util.sanitize`
+  (token/key patterns masked, length bounded).
 
-## 3. Executor en transport
+## 3. Executor and transport
 
-- **Standaard `dry-run`**: niets wordt uitgevoerd; audit-regels documenteren
-  wat er zou gebeuren (§49, `mode=dry_run` in `action_audit`).
-- Transport is de bestaande geharde **SSH agent-operator dispatcher**: plantokens
-  (10 min TTL, eenmalig), CONFIRM-DANGEROUS voor gevaarlijke klassen, audit op de
-  host, allowlist van schrijfwortels. Geen `/var/run/docker.sock` in de container
-  (docker.sock = root-equivalent; §38). AI-processen draaien in dezelfde container
-  maar hebben géén SSH-sleutel tot de operator-identiteit zodra die via file-
-  permissies (0600, eigen uid) uit hun bereik gehouden wordt; executor-modus
-  `guarded` vereist bovendien expliciete configuratie.
-- Pogingen per incident: max 2 (`max_attempts_per_incident`); targets moeten
-  desired-state MANAGED/OPTIONAL hebben — DISCOVERED/RETIRED/IGNORED worden
-  geweigerd (getest).
+- **Default `dry-run`**: nothing executes; audit rows document what would
+  happen (§49, `mode=dry_run` in `action_audit`).
+- Transport is the existing hardened **SSH operator dispatcher**: plantokens
+  (10 min TTL, single use), CONFIRM-DANGEROUS for dangerous classes, host-side
+  audit, allowlisted write roots. No `/var/run/docker.sock` in the container
+  (docker.sock = root-equivalent; §38).
+- 2.1 guardrails (all tested in `tests/test_guarded_executor.py`):
+  - `executor.real_actions_enabled` master kill switch (default **false**);
+    with `mode=guarded` and the switch off, execution behaves as dry-run;
+  - `protected_targets` deny list (e.g. Beacon, Netdata, Hermes itself,
+    databases, reverse proxies);
+  - automatic actions require desired-state **MANAGED** (DISCOVERED/RETIRED/
+    IGNORED denied; OPTIONAL reachable only via explicit Telegram approval);
+  - target strings must pass strict identifier validation (no shell
+    metacharacters/paths — rejected before dispatch);
+  - per-target cooldown + hourly/daily attempt budgets, persisted in
+    `action_audit` so they survive restarts;
+  - idempotency: one real attempt per (incident, capability, target) episode;
+  - one real remediation at a time (bounded concurrency);
+  - correlated root incident active → child remediation deferred;
+  - fresh pre-execution recheck on live Beacon inventory: condition gone →
+    CANCEL, never execute;
+  - scoped approvals are single-use, expire, and are scoped to
+    (incident, action-class, target).
 
 ## 4. Telegram (§57)
 
-- Alleen `allowed_usernames` / `allowed_chat_ids` komen door
-  (`CommandHandler._authorize`, getest: niet-geautoriseerde user wordt geweigerd).
-- `update_id`-dedup: replay van commands wordt genegeerd (getest).
-- "los het op" creëert een **scoped** goedkeuring: (incident, action-class,
-  target), TTL 10 min, eenmalig; verkeerde target/klasse/verlopen/hergebruik
-  wordt geweigerd (getest).
-- Mutatie-commando's (/fix, /approve) loggen initiator `telegram/<user>` in de
+- Only `home_chat_id` (private, trusted interaction chat),
+  `allowed_user_ids`, `allowed_chat_ids` / `allowed_usernames` get through
+  (`CommandHandler._authorize`, tested: unauthorized users rejected; group
+  home chats require an explicitly authorized user).
+- `update_id` dedup: replayed commands are ignored (tested).
+- "los het op" creates a **scoped** approval: (incident, action-class,
+  target), TTL 10 min, single use; wrong target/class/expired/reused is
+  rejected (tested).
+- Mutation commands (/fix, /approve) log initiator `telegram/<user>` in the
   audit.
+- **Telegram authorization ≠ execution authorization**: talking does not
+  permit mutating; the executor mode and kill switch decide that.
 
-## 5. Netwerk & SSRF
+## 5. Network & SSRF
 
-- Observer-clients volgen géén redirects (`allow_redirects=False`), alle calls
-  zijn GET met timeouts, retries met bounded backoff + circuit breakers.
-- Config-URLs komen uit het eigen config-volume; geen gebruikersinput in URLs.
-- Het health/diagnostics endpoint bindt op 127.0.0.1 in de container en stelt
-  geen secrets bloot (alleen counters/versie).
+- Observer clients follow no redirects (`allow_redirects=False`); all calls
+  are GET with timeouts, bounded-backoff retries + circuit breakers.
+- Config URLs come from the own config volume; no user input in URLs.
+- The health/diagnostics endpoint binds to 127.0.0.1 inside the container and
+  exposes no secrets (counters/version only).
 
 ## 6. Secrets
 
-- Secrets staan uitsluitend in env (`env:NAAM`-referenties in config) of
-  `/data/secrets.env` (0600). Ze worden nooit gelogd (`sanitize` als laatste
-  verdediging), nooit in de audit/message-velden gezet, en de CI faalt op
-  token-patronen in de tree (grep-gate in `ci.yml`).
-- De migratietool schrijft v1-secrets naar `secrets.env` met chmod 600 en houdt
-  ze buiten `config.yaml` (getest).
+- Secrets live exclusively in env (`env:NAME` references in config) or
+  `/data/secrets.env` (0600). They are never logged (`sanitize` as last
+  resort), never placed into audit/message fields; CI fails on token patterns
+  in the tree (grep gate in `ci.yml`).
+- The migration tool writes v1 secrets to `secrets.env` with chmod 600 and
+  keeps them out of `config.yaml` (tested).
 
 ## 7. Fail-safe
 
-- Elke externe aanroep is failure-isolated; een cycle faalt nooit door één bron.
-- AI uit/beide providers down → monitoring + runbooks draaien door (getest).
-- Beacon uit → fallback-probe maakt onderscheid tussen Beacon-storing en
-  host-uitval (getest). Telegram uit → pending-wachtrij met backoff, geen
-  event-verlies (getest).
+- Every external call is failure-isolated; one source can never kill a cycle.
+- AI off/both providers down → monitoring + runbooks continue (tested).
+- Beacon down → fallback probe distinguishes Beacon outage from host outage
+  (tested). Telegram down → pending queue with backoff, no event loss (tested).
 
-## Restrisico's (bewust gedocumenteerd)
+## Residual risks (documented deliberately)
 
-1. SSH-operator sleutel in het /data-volume: file-permissies zijn de grens.
-   Mitigatie later: aparte executor-sidecar (onderzoeksitem, spec §38).
-2. De Agent API van Beacon vertrouwt (bij `AGENT_API_TRUST_LOCAL`) op
-   X-Forwarded-For — daarom gebruikt Hermes altijd een **token**, niet
-   trust-local.
-3. Prompt-injection via container-namen/labels blijft een model-risico; mitigatie
-   is de schema-validatie + capability-allowlist + policy-engine, niet het model.
+- The SSH operator identity can restart allowlisted containers by design; the
+  dispatcher-side allowlist is the blast-radius boundary.
+- A wrong-but-policy-legal restart (e.g. of a container that would have
+  recovered by itself) is a bounded, audited, self-limiting action: cooldowns
+  and budgets prevent loops, and verification prevents false success.

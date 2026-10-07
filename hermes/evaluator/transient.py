@@ -62,6 +62,6 @@ class TransientTracker:
             )
             if pattern:
                 info(
-                    "transients", "pattern incident bevestigd",
+                    "transients", "pattern incident confirmed",
                     fingerprint=fp, count=row["n"], window_hours=int(self.window / 3600),
                 )

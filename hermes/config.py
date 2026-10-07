@@ -132,6 +132,18 @@ DEFAULTS: dict[str, Any] = {
         # dry-run  -> log what would be done (spec §49)
         # guarded  -> real actions, gated by policy/approvals
         "mode": "dry-run",
+        # master kill switch: when False, guarded mode behaves as dry-run.
+        # Flip back to dry-run-safe without rebuilding (2.1 §E4).
+        "real_actions_enabled": False,
+        # targets Hermes may never touch, regardless of lifecycle/registry
+        "protected_targets": [],
+        # restart-loop prevention: budgets are enforced from the persistent
+        # action_audit, so they survive Hermes restarts (2.1 §C6)
+        "target_cooldown_seconds": 900,
+        "max_attempts_per_target_hour": 3,
+        "max_attempts_per_target_day": 6,
+        # bounded concurrency: initially one real remediation at a time (§C16)
+        "max_concurrent_real_actions": 1,
         "transport": "ssh-operator",
         "ssh_host": "",
         "ssh_key_path": "",

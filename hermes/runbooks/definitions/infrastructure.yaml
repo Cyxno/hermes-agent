@@ -1,14 +1,14 @@
 # Runbook definitions — infrastructure & observability (spec §21).
 storage_latency:
   description: >
-    Disk-await of iowait-band actief. Altijd diagnose-only: de oorzaak zit in
-    werklast of hardware, niet in één container. Correlatie genereert het
-    root-incident; dit runbook levert bewijs aan AI/mens.
+    Disk-await or iowait band active. Always diagnosis-only: the cause lies in
+    workload or hardware, not in a single container. Correlation generates the
+    root incident; this runbook supplies evidence to AI/human.
   detect: [disk_await_ms, host_iowait_pct]
   possible_causes:
-    - zware IO-worklast (backups, parity check, scraper)
-    - falende schijf (zie SMART via Beacon issues)
-    - cache-pool vol of fragmentatie
+    - heavy IO workload (backups, parity check, scraper)
+    - failing disk (see SMART via Beacon issues)
+    - cache pool full or fragmentation
   preconditions: []
   diagnose: []
   actions: []
@@ -17,11 +17,12 @@ storage_latency:
 
 filesystem_readonly:
   description: >
-    Read-only filesystem. NOOIT automatisch handelen; direct mens escaleren.
+    Read-only filesystem. NEVER act automatically; escalate to a human
+    immediately.
   detect: [filesystem_readonly]
   possible_causes:
-    - fs-fout; array in beschermde modus
-    - hardware-fout
+    - filesystem error; array in protected mode
+    - hardware failure
   preconditions: []
   diagnose: []
   actions: []
@@ -30,12 +31,12 @@ filesystem_readonly:
 
 network_packet_loss:
   description: >
-    Netwerk-fouten of drops. Diagnose-only met interface-evidence.
+    Network errors or drops. Diagnosis-only with interface evidence.
   detect: [net_errors_per_s]
   possible_causes:
-    - kabel/NIC-probleem
-    - driver of bridge-issue
-    - externe netwerkstorung
+    - cable/NIC problem
+    - driver or bridge issue
+    - external network outage
   preconditions: []
   diagnose: []
   actions: []
@@ -44,14 +45,14 @@ network_packet_loss:
 
 beacon_unavailable:
   description: >
-    Beacon onbereikbaar terwijl de host via fallback reageert. Diagnosticeert
-    of Beacon zelf of de koppeling het probleem is; geen automatische acties
-    op Beacon (Beacon is infrastructuur, geen managed service van Hermes).
+    Beacon unreachable while the host responds via fallback. Diagnoses whether
+    Beacon itself or the link is the problem; no automatic actions against
+    Beacon (Beacon is infrastructure, not a Hermes-managed service).
   detect: [beacon_unavailable, beacon_stale]
   possible_causes:
-    - beacon-container gestopt of herstartend
-    - netwerk/proxy-probleem
-    - Agent API uitgeschakeld (config)
+    - beacon container stopped or restarting
+    - network/proxy problem
+    - Agent API disabled (config)
   preconditions: []
   diagnose: []
   actions: []
@@ -60,12 +61,12 @@ beacon_unavailable:
 
 netdata_unavailable:
   description: >
-    Netdata onbereikbaar. Hermes gaat door met alleen Beacon en markeert
-    observability degraded; diagnose-only.
+    Netdata unreachable. Hermes continues on Beacon alone and marks
+    observability degraded; diagnosis-only.
   detect: [netdata_unavailable]
   possible_causes:
-    - netdata-container gestopt
-    - poort/configwijziging
+    - netdata container stopped
+    - port/config change
   preconditions: []
   diagnose: []
   actions: []

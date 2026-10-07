@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Hermes v2 — Unraid Community Applications template.
      Plaats dit bestand in /boot/config/plugins/dockerMan/templates/ als my-Hermes-Agent.xml.
-     Conventies gecontroleerd tegen de bestaande my-*.xml templates op deze server. -->
+     Conventions checked against the existing my-*.xml templates on this server. -->
 <Container version="2">
   <Name>Hermes-Agent</Name>
   <Repository>ghcr.io/cyxno/hermes-agent:latest</Repository>
@@ -16,14 +16,14 @@
   <Support>https://github.com/Cyxno/hermes-agent/issues</Support>
   <Project>https://github.com/Cyxno/hermes-agent</Project>
   <Overview>
-    Hermes v2 — stateful, low-noise, AI-assisted autonomous operations agent voor Unraid.
-    Beacon observeert (primaire bron), Netdata voegt diepte toe, Hermes interpreteert en handelt:
-    incident state machine met debounce/hysteresis, correlatie, deterministic runbooks, AI-escalatie
-    (Gemini 2.5 Flash-Lite -> DeepSeek V4 Flash, structured output) en een executor die standaard op
-    DRY-RUN staat. Meldingen zijn exceptioneel: final recheck vóór elke Telegram-melding.
-    Documentatie: https://github.com/Cyxno/hermes-agent#readme
-    LET OP: de Agent API van Beacon (unraid-dashboard) moet actief zijn met een token
-    (minimaal 32 tekens) — zie docs/MIGRATION.md.
+    Hermes v2 — stateful, low-noise, AI-assisted autonomous operations agent for Unraid.
+    Beacon observes (primary source), Netdata adds depth, Hermes interprets and acts:
+    incident state machine with debounce/hysteresis, correlation, deterministic runbooks, AI escalation
+    (Gemini 2.5 Flash-Lite -> DeepSeek V4 Flash, structured output) and an executor that defaults to
+    DRY-RUN. Notifications are exceptional: final recheck before every Telegram notification.
+    Documentation: https://github.com/Cyxno/hermes-agent#readme
+    NOTE: Beacon's Agent API (unraid-dashboard) must be active with a token
+    (minimum 32 chars) — see docs/MIGRATION.md.
   </Overview>
   <Category>Tools: System Productivity:Monitoring</Category>
   <WebUI></WebUI>
@@ -37,17 +37,17 @@
   <DonateLink></DonateLink>
   <Description>Hermes v2 autonomous operations agent</Description>
   <Config Name="Data (state, config, secrets)" Target="/data" Default="/mnt/user/appdata/hermes-v2/data" Mode="rw" Description="Persistentie: hermes.db, config.yaml, secrets.env. State en historie overleven updates." Type="Path" Display="always" Required="true" Mask="false"/>
-  <Config Name="Timezone" Target="TZ" Default="Europe/Amsterdam" Mode="" Description="Tijdzone voor dagoverzichten en onderhoudsvensters." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Timezone" Target="TZ" Default="Europe/Amsterdam" Mode="" Description="Timezone for daily summaries and maintenance windows." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Mode (normal|shadow)" Target="HERMES_MODE" Default="shadow" Mode="" Description="shadow = observeert en evalueert volledig, maar verstuurt GEEN meldingen en voert NIETS uit. Zet pas op normal na geslaagde shadow-validatie." Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="Executor mode (disabled|dry-run|guarded)" Target="HERMES_EXECUTOR_MODE" Default="dry-run" Mode="" Description="disabled = geen acties. dry-run = logt wat hij zou doen. guarded = echte acties, gated door policy + scoped goedkeuring. Verandering vereist bewuste keuze; zie docs/SECURITY.md." Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="Log level" Target="HERMES_LOG_LEVEL" Default="info" Mode="" Description="Structured JSON logging: debug|info|warning|error." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  <Config Name="Beacon Agent API token" Target="BEACON_AGENT_API_TOKEN" Default="" Mode="" Description="Bearer token voor de Beacon (/api/agent/v1) Agent API van unraid-dashboard. Minimaal 32 tekens. Zelfde waarde als AGENT_API_TOKEN in de unraid-dashboard template." Type="Variable" Display="always" Required="true" Mask="true"/>
-  <Config Name="Telegram bot token" Target="TELEGRAM_BOT_TOKEN" Default="" Mode="" Description="Bot token van @BotFather. Gebruik bij voorkeur een eigen bot voor Hermes v2 tijdens shadow-validatie." Type="Variable" Display="always" Required="false" Mask="true"/>
-  <Config Name="Telegram home chat id" Target="TELEGRAM_HOME_CHAT_ID" Default="" Mode="" Description="Chat-id waar alerten naartoe gaan EN waar commando's mogen komen (private chat = trusted interaction chat; groep vereist ook allowed usernames/user-ids)." Type="Variable" Display="always" Required="false" Mask="true"/>
-  <Config Name="Telegram allowed usernames" Target="HERMES_TG_ALLOWED" Default="" Mode="" Description="Komma-gescheiden usernames die commando's mogen sturen (bijv. remco). De private home-chat mag er altijd één zijn; groepen vereisen deze lijst of user-ids." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  <Config Name="Telegram allowed user-ids" Target="HERMES_TG_ALLOWED_USER_IDS" Default="" Mode="" Description="Komma-gescheiden Telegram user-ids (robuster dan usernames) die commando's mogen sturen." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  <Config Name="OpenRouter API key" Target="OPENROUTER_API_KEY" Default="" Mode="" Description="Voor AI-diagnose (Gemini 2.5 Flash-Lite, escalatie naar DeepSeek V4 Flash). Zonder key werkt Hermes volledig deterministisch door." Type="Variable" Display="always" Required="false" Mask="true"/>
-  <Config Name="Beacon URL" Target="HERMES_BEACON_URL" Default="http://127.0.0.1:8090" Mode="" Description="Basis-URL van Beacon (unraid-dashboard). Host-netwerk van Beacon: localhost werkt binnen bridge via de Unraid host? Nee — gebruik het LAN-adres van de server (bijv. http://192.168.1.2:8090)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  <Config Name="Netdata URL" Target="HERMES_NETDATA_URL" Default="http://127.0.0.1:19999" Mode="" Description="Basis-URL van Netdata; gebruik het LAN-adres (bijv. http://192.168.1.2:19999)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
-  <Config Name="Prometheus URL (fallback)" Target="HERMES_PROMETHEUS_URL" Default="http://127.0.0.1:9090" Mode="" Description="Alleen voor de minimale fallback-probe als Beacon onbereikbaar is." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Beacon Agent API token" Target="BEACON_AGENT_API_TOKEN" Default="" Mode="" Description="Bearer token for the Beacon (/api/agent/v1) Agent API of unraid-dashboard. Minimum 32 chars. Same value as AGENT_API_TOKEN in the unraid-dashboard template." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Telegram bot token" Target="TELEGRAM_BOT_TOKEN" Default="" Mode="" Description="Bot token from @BotFather. Prefer a dedicated bot for Hermes v2." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Telegram home chat id" Target="TELEGRAM_HOME_CHAT_ID" Default="" Mode="" Description="Chat id alerts go to AND commands may come from (private chat = trusted interaction chat; groups also require allowed usernames/user ids)." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Telegram allowed usernames" Target="HERMES_TG_ALLOWED" Default="" Mode="" Description="Comma-separated usernames allowed to send commands (e.g. remco). The private home chat is always trusted; groups require this list or user ids." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Telegram allowed user-ids" Target="HERMES_TG_ALLOWED_USER_IDS" Default="" Mode="" Description="Comma-separated Telegram user ids (more robust than usernames) allowed to send commands." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="OpenRouter API key" Target="OPENROUTER_API_KEY" Default="" Mode="" Description="For AI diagnosis (Gemini 2.5 Flash-Lite, escalation to DeepSeek V4 Flash). Without a key Hermes runs fully deterministic." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Beacon URL" Target="HERMES_BEACON_URL" Default="http://127.0.0.1:8090" Mode="" Description="Base URL of Beacon (unraid-dashboard). Use the server LAN address (e.g. http://192.168.1.2:8090); localhost does not work from a bridge container." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Netdata URL" Target="HERMES_NETDATA_URL" Default="http://127.0.0.1:19999" Mode="" Description="Base URL of Netdata; use the LAN address (e.g. http://192.168.1.2:19999)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Prometheus URL (fallback)" Target="HERMES_PROMETHEUS_URL" Default="http://127.0.0.1:9090" Mode="" Description="Only for the minimal fallback probe when Beacon is unreachable." Type="Variable" Display="advanced" Required="false" Mask="false"/>
 </Container>

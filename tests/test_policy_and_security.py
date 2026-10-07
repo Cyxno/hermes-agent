@@ -109,7 +109,7 @@ async def test_policy_attempt_limit(exec_stack):
                       incident_id="container_unhealthy:plex")
     result = await exec_stack["executor"].execute(plan)
     assert result.status == "denied"
-    assert "pogingen" in result.detail
+    assert "attempts per incident" in result.detail
 
 
 # ---------------------------------------------------------------------------
@@ -164,3 +164,47 @@ def test_context_builder_truncates(tmp_path):
     big = {"id": "x", "entity": "e", "evidence": [{"detail": "x" * 3000} for _ in range(10)]}
     text = builder.build(big)
     assert len(text) <= 500
+
+
+# ---------------------------------------------------------------- 2.1 guardrails
+
+async def test_policy_protected_target_denied(exec_stack):
+    exec_stack["policy"].protected_targets = {"netdata"}
+    cap = exec_stack["registry"].get("docker.restart")
+    decision = exec_stack["policy"].decide(cap, "netdata", "MANAGED")
+    assert decision.decision == "deny" and "protected" in decision.reason
+
+
+async def test_policy_rejects_malicious_targets(exec_stack):
+    cap = exec_stack["registry"].get("docker.restart")
+    for bad in ("plex; rm -rf /", "$(reboot)", "plex && reboot", "../../x", "plex\necho"):
+        decision = exec_stack["policy"].decide(cap, bad, "MANAGED")
+        assert decision.decision == "deny", bad
+        assert "identifier" in decision.reason
+
+
+async def test_policy_automatic_requires_managed(exec_stack):
+    cap = exec_stack["registry"].get("docker.restart")
+    assert exec_stack["policy"].decide(cap, "plex", "DISCOVERED").decision == "deny"
+    assert exec_stack["policy"].decide(cap, "plex", "RETIRED").decision == "deny"
+    assert exec_stack["policy"].decide(cap, "plex", "MANAGED", initiator="automatic").decision == "allow"
+    # telegram-initiated may still touch OPTIONAL
+    assert exec_stack["policy"].decide(
+        cap, "plex", "OPTIONAL", initiator="telegram/remco"
+    ).decision == "allow"
+
+
+async def test_policy_root_incident_suppresses_child(exec_stack):
+    cap = exec_stack["registry"].get("docker.restart")
+    decision = exec_stack["policy"].decide(cap, "plex", "MANAGED", root_incident_open=True)
+    assert decision.decision == "defer" and "root incident" in decision.reason
+
+
+async def test_policy_cooldown_and_budgets(exec_stack):
+    cap = exec_stack["registry"].get("docker.restart")
+    hot = exec_stack["policy"].decide(cap, "plex", "MANAGED", budgets={"cooldown_ok": False})
+    assert hot.decision == "defer" and "cooldown" in hot.reason
+    hourly = exec_stack["policy"].decide(cap, "plex", "MANAGED", budgets={"attempts_hour": 99})
+    assert hourly.decision == "defer" and "hourly" in hot.reason or hourly.decision == "defer"
+    daily = exec_stack["policy"].decide(cap, "plex", "MANAGED", budgets={"attempts_day": 99})
+    assert daily.decision == "defer" and "daily" in daily.reason

@@ -200,7 +200,7 @@ def ai_usage_for_incident(db, incident_id: str) -> dict | None:
     kosteloos, en veroorzaakt nooit een AI-call. Semantiek:
     - minstens één succesvolle call -> used, met model/tier van de laatste
       succesvolle call;
-    - alleen gefaalde calls -> used + failed (analyse mislukt);
+    - only failed calls -> used + failed (analysis failed);
     - geen enkele call -> None (AI gebruikt: nee).
     """
     try:
@@ -218,5 +218,5 @@ def ai_usage_for_incident(db, incident_id: str) -> dict | None:
         if any_row:
             return {"used": True, "model": None, "tier": None, "failed": True}
     except Exception as exc:  # noqa: BLE001 - metadata mag nooit het pad breken
-        warning("ai", "ai_usage lookup gefaald", error=sanitize(exc, 120))
+        warning("ai", "ai_usage lookup failed", error=sanitize(exc, 120))
     return None

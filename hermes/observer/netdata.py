@@ -150,7 +150,7 @@ class NetdataClient:
 
     async def host_cpu_pct(self) -> float | None:
         """Total host CPU utilization % (som van de system.cpu-dimensies; de
-        chart is gestacked utilization, idle ontbreekt als dimensie)."""
+        chart is stacked utilization; idle is not a dimension)."""
         data = await self._get("/data", {
             "chart": "system.cpu", "points": 1, "group": "average", "options": "absolute",
         })

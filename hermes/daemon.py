@@ -43,6 +43,7 @@ from .runbooks.engine import RunbookEngine
 from .runbooks.verification import Diagnostics
 from .state.db import Database
 from .state.desired import DesiredStateManager
+from .util import sanitize
 
 DEFINITIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hermes", "runbooks", "definitions")
 
@@ -138,7 +139,7 @@ class HermesApp:
         exec_cfg["mode"] = mode
         self.registry = CapabilityRegistry()
         self.policy = PolicyEngine(exec_cfg)
-        self.approvals = ApprovalStore(self.db)
+        self.approvals = ApprovalStore(self.db, self.clock)
         operator = None
         if exec_cfg.get("ssh_host"):
             operator = SshOperator(exec_cfg["ssh_host"], exec_cfg["ssh_key_path"],
@@ -147,6 +148,8 @@ class HermesApp:
             exec_cfg, self.registry, self.policy, self.approvals, operator, self.db, self.clock,
             lifecycle_lookup=self.desired.get,
             attempts_lookup=self._incident_attempts,
+            root_incident_open=self._root_incident_open,
+            fresh_recheck=self._fresh_action_recheck,
         )
         self.diagnostics = Diagnostics(
             beacon=self._BeaconShim(self.beacon), netdata=self.netdata,
@@ -194,6 +197,39 @@ class HermesApp:
             (incident_id,),
         )
         return int(row["n"]) if row else 0
+
+    def _root_incident_open(self, incident_id: str | None) -> bool:
+        """§C17: correlated root cause active -> suppress child self-healing."""
+        if not incident_id:
+            return False
+        inc = self.engine.get(incident_id)
+        if inc is None or not inc.root_incident:
+            return False
+        root = self.engine.get(inc.root_incident)
+        return bool(root and root.open)
+
+    async def _fresh_action_recheck(self, plan) -> tuple[bool, str]:  # noqa: ANN001
+        """§C13: immediately before a real mutation, fresh Beacon inventory
+        must still support the action. Separate from the notification
+        final-recheck; a stale action plan is cancelled, not executed."""
+        if self.beacon is None:
+            return True, "no beacon client; transport gates apply"
+        try:
+            docker = await self.beacon.docker()
+        except Exception as exc:  # noqa: BLE001 - cannot verify -> do not act
+            return False, f"fresh state unavailable: {sanitize(exc, 80)}"
+        view = next((d for d in docker if isinstance(d, dict) and d.get("name") == plan.target), None)
+        if view is None:
+            return False, f"{plan.target} no longer present in fresh inventory"
+        state, health = view.get("state"), view.get("health")
+        if plan.capability == "docker.restart":
+            if state != "running":
+                return False, f"{plan.target} is no longer running ({state!r})"
+            if health in (None, "healthy"):
+                return False, f"{plan.target} is healthy in fresh state (condition gone)"
+        if plan.capability == "docker.start" and state == "running":
+            return False, f"{plan.target} already runs in fresh state"
+        return True, "fresh state still supports the action"
 
     def _affected_of(self, incident_id: str) -> list[str]:
         rows = self.db.query(
@@ -248,6 +284,16 @@ class HermesApp:
         for inc in open_inc[-8:]:
             flag = " [gecorreleerd]" if inc.suppressed else ""
             lines.append(f"- {inc.severity} {inc.id} ({inc.state}){flag}")
+        # §C24: compact executor status
+        exec_cfg = self.cfg.section("executor")
+        exec_mode = str(exec_cfg["mode"])
+        if exec_mode == "guarded" and not exec_cfg.get("real_actions_enabled", False):
+            exec_mode = "guarded (dry-run safe: real_actions_enabled=false)"
+        day_start = now - (now % 86400)
+        row = self.db.one(
+            "SELECT COUNT(*) AS n FROM action_audit WHERE mode='real' AND ts >= ?", (day_start,)
+        )
+        lines.append(f"Executor: {exec_mode}, real actions today: {int(row['n']) if row else 0}")
         uptime = int(now - self.metrics.started_at)
         lines.append(f"Uptime: {uptime // 3600}h{(uptime % 3600) // 60}m, cycles: {self.metrics.cycles}")
         return "\n".join(lines)
@@ -314,7 +360,7 @@ class HermesApp:
                 await self.commands.poll_once()
                 self.metrics.telegram_polls += 1
             except Exception as exc:  # noqa: BLE001
-                warning("daemon", "telegram poll fout", error=str(exc)[:160])
+                warning("daemon", "telegram poll error", error=str(exc)[:160])
                 await asyncio.sleep(5)
 
     async def _daily_maintenance(self) -> None:
@@ -376,7 +422,7 @@ class HermesApp:
         stats["host_healthy"] = not self.engine.open_incidents()
         text = format_daily_summary(stats)
         if self.notifier.shadow:
-            info("daemon", "daily summary (shadow, niet verzonden)", stats=str(stats))
+            info("daemon", "daily summary (shadow, not sent)", stats=str(stats))
             return
         if self.telegram is not None:
             chat_id = str(self.cfg.section("telegram").get("home_chat_id") or "")
@@ -384,7 +430,7 @@ class HermesApp:
                 try:
                     await self.telegram.send_message(chat_id, text)
                 except Exception as exc:  # noqa: BLE001
-                    warning("daemon", "daily summary verzending gefaald", error=str(exc)[:120])
+                    warning("daemon", "daily summary send failed", error=str(exc)[:120])
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -424,7 +470,7 @@ class HermesApp:
             asyncio.create_task(self._telegram_loop()),
             asyncio.create_task(self._health_server()),
         ]
-        info("daemon", "Hermes gestart", mode=self.cfg.mode, executor=self.cfg.section("executor")["mode"],
+        info("daemon", "Hermes started", mode=self.cfg.mode, executor=self.cfg.section("executor")["mode"],
              **version_info())
 
     async def _daily_loop(self) -> None:
@@ -485,7 +531,7 @@ class HermesApp:
         await runner.cleanup()
 
     async def stop(self) -> None:
-        info("daemon", "graceful shutdown gestart")
+        info("daemon", "graceful shutdown started")
         self._stop.set()
         if self.stream is not None:
             self.stream.stop()
@@ -497,7 +543,7 @@ class HermesApp:
         if self.telegram is not None:
             await self.telegram.close()
         self.db.close()
-        info("daemon", "gestopt")
+        info("daemon", "stopped")
 
 
 async def run_daemon(config_path: str | None) -> None:

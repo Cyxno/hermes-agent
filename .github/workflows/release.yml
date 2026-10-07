@@ -1,8 +1,19 @@
 name: release
 
+# Stable release pipeline. Pushing an immutable tag vMAJOR.MINOR.PATCH runs:
+# gate (tag == pyproject version) -> tests -> lint -> build -> GHCR publish
+# -> GitHub release with traceability.
+#
+# Prereleases (tags containing "-", e.g. v2.1.0-rc.1) publish the rc version
+# tag and X.Y-rc but NEVER move `latest`.
+#
+# Hard rule (docs/RELEASE.md): once pushed, a tag is never moved or deleted.
+# A broken release is fixed by the next patch version.
+
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: {}   # test route (B7): run the pipeline without a tag
 
 permissions:
   contents: write
@@ -11,9 +22,12 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # workflow_dispatch runs against a branch: gate the publish steps on a
+    # real tag ref so dispatch is a safe dry validation
     steps:
       - uses: actions/checkout@v4
-      - name: Verify tag matches version
+      - name: Verify tag matches version (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PY_VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -27,20 +41,28 @@ jobs:
           ruff check hermes tests
           python -m pytest tests/ -q
       - uses: docker/setup-buildx-action@v3
+      - name: Resolve build time (head_commit is empty on tag pushes)
+        id: bt
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # latest=auto: prereleases (rc) never move `latest`
+          flavor: latest=${{ !contains(github.ref_name, '-') }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}}-rc,enable=${{ contains(github.ref_name, '-rc') }}
       - name: Build and push
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -50,8 +72,16 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             GIT_SHA=${{ github.sha }}
-            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+            BUILD_TIME=${{ steps.bt.outputs.time }}
+      - name: Build sanity (no push) on dispatch runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: hermes-agent:dispatch-check
       - name: Release notes with traceability
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           body: |
@@ -59,6 +89,6 @@ jobs:
 
             - image: `ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
             - git sha: `${{ github.sha }}`
-            - build time: `${{ github.event.head_commit.timestamp }}`
-            - digest: zie het `ghcr.io`-pakket (immutable version tag)
+            - build time: `${{ steps.bt.outputs.time }}`
+            - digest: see the `ghcr.io` package (immutable version tag)
           generate_release_notes: true

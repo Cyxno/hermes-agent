@@ -196,9 +196,9 @@ class IncidentEngine:
         if incident.state in ("OBSERVED", "PENDING"):
             if now - incident.first_seen >= debounce or sig.category in IMMEDIATE_CATEGORIES:
                 if incident.state != "CONFIRMED":
-                    self._transition(incident, "CONFIRMED", f"debounce ({debounce:.0f}s) gehaald", sig.severity, now)
+                    self._transition(incident, "CONFIRMED", f"debounce ({debounce:.0f}s) passed", sig.severity, now)
             elif incident.state != "PENDING":
-                self._transition(incident, "PENDING", "in debounce-venster", sig.severity, now, quiet=True)
+                self._transition(incident, "PENDING", "in debounce window", sig.severity, now, quiet=True)
 
     def _create(self, sig: Signal, now: float) -> Incident:
         # reopen a recently resolved incident instead of creating a new row
@@ -239,11 +239,11 @@ class IncidentEngine:
         )
         self.db.execute(sql, incident.to_row(now))
         if reopen:
-            self._event(incident.id, now, "RESOLVED", "OBSERVED", "reopen binnen venster", sig.severity)
+            self._event(incident.id, now, "RESOLVED", "OBSERVED", "reopen within window", sig.severity)
             if flap_count >= self.flap_threshold:
                 info("incidents", "incident flapping", incident_id=incident.id, flap_count=flap_count)
         else:
-            self._event(incident.id, now, None, "OBSERVED", "nieuw signaal", sig.severity)
+            self._event(incident.id, now, None, "OBSERVED", "new signal", sig.severity)
         return incident
 
     def _update(self, incident: Incident, sig: Signal, now: float) -> None:
@@ -263,11 +263,11 @@ class IncidentEngine:
         if incident is None or not incident.open:
             return
         if incident.state in ("OBSERVED", "PENDING"):
-            self._resolve(incident, now, "conditie verdwenen vóór bevestiging (transient)")
+            self._resolve(incident, now, "condition gone before confirmation (transient)")
             return
-        self._transition(incident, "RECOVERING", "band cleared, wacht op bevestiging", sig.severity, now)
+        self._transition(incident, "RECOVERING", "band cleared, awaiting confirmation", sig.severity, now)
         # explicit band recovery is already sample-confirmed by hysteresis: resolve now
-        self._resolve(incident, now, "conditie bevestigd weg (hysteresis clear)")
+        self._resolve(incident, now, "condition confirmed gone (hysteresis clear)")
 
     # ------------------------------------------------------------------
     def tick(self) -> list[dict]:
@@ -279,22 +279,22 @@ class IncidentEngine:
             if incident.state in ("OBSERVED", "PENDING"):
                 stale = not incident.last_seen or now - incident.last_seen > self.absence_grace
                 if stale:
-                    self._resolve(incident, now, "conditie verdwenen vóór bevestiging (transient)")
+                    self._resolve(incident, now, "condition gone before confirmation (transient)")
                 else:
                     debounce = float(self.config.get("debounce", {}).get(incident.category, 0))
                     recent = incident.last_seen and now - incident.last_seen <= self.fast_interval * 1.5
                     if recent and (now - incident.first_seen >= debounce or incident.category in IMMEDIATE_CATEGORIES):
-                        self._transition(incident, "CONFIRMED", "debounce gehaald (tick)", incident.severity, now)
+                        self._transition(incident, "CONFIRMED", "debounce passed (tick)", incident.severity, now)
             elif incident.state == "CONFIRMED":
                 intents.append({"kind": "alert", "incident": incident})
             elif incident.state == "ACTIVE":
                 if (incident.category != "transient_pattern"
                         and incident.last_seen
                         and now - incident.last_seen > self.absence_grace):
-                    # pattern-incidenten volgen het transient-venster, niet het
-                    # live-signaal; de tracker lost ze af wanneer het venster
-                    # leeg raakt (een momentane clear is geen episode-einde)
-                    self._transition(incident, "RECOVERING", "geen signalen meer", incident.severity, now)
+                    # pattern incidents follow the transient window, not the live
+                    # signal; the tracker resolves them when the window empties
+                    # (a momentary clear is not an episode end)
+                    self._transition(incident, "RECOVERING", "no signals left", incident.severity, now)
                 elif incident.notified_active and incident.last_notified_at and (
                     now - incident.last_notified_at
                     >= self._repeat_cooldown(incident.severity) * 60  # cooldowns in minuten
@@ -302,12 +302,12 @@ class IncidentEngine:
                     intents.append({"kind": "reminder", "incident": incident})
             elif incident.state == "RECOVERING":
                 if incident.category == "transient_pattern":
-                    self._transition(incident, "ACTIVE", "patroon-incident: geen live-clear", incident.severity, now)
+                    self._transition(incident, "ACTIVE", "pattern incident: no live-clear", incident.severity, now)
                 elif incident.last_seen and now - incident.last_seen > self.absence_grace:
-                    self._resolve(incident, now, "hersteld (afwezigheid bevestigd)")
+                    self._resolve(incident, now, "recovered (absence confirmed)")
                 elif incident.last_seen and now - incident.last_seen <= self.fast_interval:
                     # condition came back during recovering
-                    self._transition(incident, "ACTIVE", "conditie terug tijdens herstel", incident.severity, now)
+                    self._transition(incident, "ACTIVE", "condition returned during recovery", incident.severity, now)
         if self._pending_resolved:
             intents.extend(self._pending_resolved)
             self._pending_resolved.clear()
@@ -326,11 +326,11 @@ class IncidentEngine:
         incident.notification_sent = True
         incident.last_notified_at = ts
         incident.last_notified_severity = severity
-        # een verzonden recovery sluit de alert-episode af; reminders/recovery
-        # vereisen daarna een NIEUWE alert
+        # a delivered recovery closes the alert episode; reminders/recovery
+        # then require a NEW alert
         incident.notified_active = kind != "resolved"
         if incident.state == "CONFIRMED":
-            self._transition(incident, "ACTIVE", "notificatie verzonden", severity, ts)
+            self._transition(incident, "ACTIVE", "notification sent", severity, ts)
         else:
             self._persist(incident, ts)
 
@@ -339,7 +339,7 @@ class IncidentEngine:
         incident = self._incidents.get(incident_id)
         if incident is None or incident.state != "CONFIRMED":
             return
-        self._transition(incident, "ACTIVE", "acknowledged (notice, geen notificatie)",
+        self._transition(incident, "ACTIVE", "acknowledged (notice, no notification)",
                          incident.severity, self.clock.now())
 
     def mark_cancelled(self, incident_id: str, reason: str) -> None:
@@ -390,11 +390,11 @@ class IncidentEngine:
             (pid,),
         )
         if prior and (now - prior["resolved_at"]) <= self.transient_window:
-            # Heropen dezelfde episode binnen het transient-venster, mét de
-            # oorspronkelijke notificatieboekhouding: een verse INSERT OR REPLACE
-            # resette notification_sent/last_notified_at, waardoor elke fling
-            # opnieuw als eerste alert verstuurd werd (soak 2026-10-07: 28
-            # duplicaten in ~2,5 uur op plex-scraper-vfs).
+            # Reopen the same episode within the transient window, keeping the
+            # original notification bookkeeping: a fresh INSERT OR REPLACE reset
+            # notification_sent/last_notified_at, turning every flap into a
+            # fresh first alert (soak 2026-10-07: 28 duplicates in ~2.5h on
+            # plex-scraper-vfs).
             incident = Incident.from_row(prior)
             incident.state = "ACTIVE" if incident.notification_sent else "CONFIRMED"
             incident.resolved_at = None
@@ -411,7 +411,7 @@ class IncidentEngine:
             self._incidents[pid] = incident
             self._persist(incident, now)
             self._event(pid, now, "RESOLVED", incident.state,
-                        "patroon heropend binnen venster (notificatie behouden, geen nieuwe alert)",
+                        "pattern reopened within window (notification preserved, no new alert)",
                         "warning")
             return incident
         incident = Incident(
@@ -440,7 +440,7 @@ class IncidentEngine:
              incident.state, incident.first_seen, incident.last_seen, incident.confirmed_at,
              incident.occurrences, json_dumps(incident.evidence), now),
         )
-        self._event(pid, now, None, "CONFIRMED", "patroon: herhaalde transients", "warning")
+        self._event(pid, now, None, "CONFIRMED", "pattern: repeated transients", "warning")
         return incident
 
     # ------------------------------------------------------------------
@@ -472,7 +472,7 @@ class IncidentEngine:
         elif (from_state in OPEN_STATES and incident.notification_sent
                 and incident.notified_active
                 and self.config.get("telegram", {}).get("notify_recovery", True)):
-            # Recovery-notificatie: alleen na eerder verzonden alert (spec §11).
+            # Recovery notification: only after a previously sent alert (spec §11).
             # De pipeline doet de verplichte final recheck; kwam de conditie
             # toch terug, dan wordt de recovery geannuleerd.
             self._pending_resolved.append({"kind": "resolved", "incident": incident})
@@ -509,9 +509,14 @@ class IncidentEngine:
     def incident_snapshot(self, incident: Incident) -> dict[str, Any]:
         from ..intelligence.provider import ai_usage_for_incident
 
+        rem = self.db.one(
+            "SELECT outcome, runbook, detail FROM remediations WHERE incident_id=? "
+            "ORDER BY ts DESC LIMIT 1", (incident.id,),
+        )
         return {
             "id": incident.id,
             "ai_usage": ai_usage_for_incident(self.db, incident.id),
+            "remediation": dict(rem) if rem else None,
             "category": incident.category,
             "entity": incident.entity,
             "title": incident.title,

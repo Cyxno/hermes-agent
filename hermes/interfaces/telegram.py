@@ -70,7 +70,7 @@ class TelegramClient:
                 body = await resp.json(content_type=None)
                 if resp.status == 200 and isinstance(body, dict) and body.get("ok"):
                     return body.get("result", [])
-                warning("telegram", "getUpdates mislukt", detail=sanitize(body, 120))
+                warning("telegram", "getUpdates failed", detail=sanitize(body, 120))
                 return []
         except (aiohttp.ClientError, TimeoutError, OSError) as exc:
             warning("telegram", "getUpdates netwerkfout", error=sanitize(exc, 120))
@@ -80,6 +80,22 @@ class TelegramClient:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+def _self_healing_line(snapshot: dict) -> str | None:
+    """§C21: compact remediation status — only when there is something to say."""
+    rem = snapshot.get("remediation")
+    if rem:
+        outcome = str(rem.get("outcome", ""))
+        rb = rem.get("runbook") or "runbook"
+        if outcome in ("resolved", "success"):
+            return f"Zelfherstel: gelukt — {rb}"
+        if outcome == "needs_approval":
+            return f"Zelfherstel: wacht op goedkeuring ({rb})"
+        if outcome in ("failed", "action_failed", "verification_failed"):
+            return f"Zelfherstel: gefaald — {rb} ({str(rem.get('detail', ''))[:60]})"
+        return f"Zelfherstel: {outcome} — {rb}"
+    return None
 
 
 def _ai_usage_line(snapshot: dict) -> str:
@@ -126,6 +142,9 @@ def format_alert(kind: str, snapshot: dict, affected: list[str] | None = None,
         ))
     if affected:
         lines.append("Getroffen: " + ", ".join(affected[:10]))
+    healing = _self_healing_line(snapshot)
+    if healing:
+        lines.append(healing)
     lines.append(ai_line)
     if ai_explanation:
         lines.append("")

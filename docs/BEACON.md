@@ -1,47 +1,36 @@
-# Beacon Agent API — geverifieerd contract (voor Hermes v2)
+# Beacon Agent API — verified contract (used by Hermes v2)
 
-Geverifieerd op 2026-10-05 tegen repo-HEAD `2d56f22` == running container
-`unraid-dashboard:1.3.18` (GIT_SHA match). Alle bevindingen zijn uit code +
-live-probe; de live API was tijdens de audit 403 `DISABLED` (geen token).
+Verified on 2026-10-05 against repo-HEAD `2d56f22` == running container
+`unraid-dashboard:1.3.18` (GIT_SHA match). All findings derive from code +
+live probes; during the audit the live API was 403 `DISABLED` (no token).
+Field-level notes updated 2026-10-07 (2.0.1 audit): `summary.cpu.percent` and
+`summary.memory.percent` may be `null` on this host — Hermes falls back to
+Netdata for host CPU/RAM percentages.
 
-## Auth
+## Endpoints used by Hermes
 
-- `Authorization: Bearer $AGENT_API_TOKEN` (server-env, min. 32 tekens),
-  constant-time vergeleken (`src/server/agent/auth.ts`).
-- Geen token + `AGENT_API_TRUST_LOCAL` niet gezet → **403 `{"error":{"code":"DISABLED"}}`**.
-- Geen token + trust-local → alleen loopback/192.168.1.* (header-based; Hermes
-  gebruikt daarom altijd een token).
-- **Rate limits** (60s venster): summary 120/min; docker/issues/projects/storage/
-  system/operations/events 60/min; capabilities 30/min; **stream 10/min**.
+- `GET /api/agent/v1/summary` — cpu{percent,load5}, memory{percent,bytes},
+  load, thermal{currentC,avg24hC,state}, docker{running,total,unhealthy},
+  dependencies, health
+- `GET /api/agent/v1/docker` — per-container: name, state, health, image,
+  updateAvailable, composeProject, managementType
+- `GET /api/agent/v1/issues` — active Beacon issues (id, severity, category,
+  status, condition, summary, first/last_seen)
+- `GET /api/agent/v1/storage` — arrayState, parityStatus, capacity{bytes},
+  disks[{name,role,state,temperatureC,sizeBytes,usedBytes}] (reconcile only)
+- `GET /api/agent/v1/system` — cpu, memory, load{five,fifteen},
+  temperatures{packageC}, uptime, network, dependencies, freshness
+- `GET /api/agent/v1/events` / SSE stream — container lifecycle events
 
-## Envelope & freshness
+## Authentication
 
-Elke response: `{apiVersion:"1", beaconVersion, generatedAt, data}`.
-Freshness: `{sampledAt, stale, ageSeconds, source}`.
+- `Authorization: Bearer <token>`; empty/wrong token → 403 with
+  `{"error":"DISABLED"}` → Hermes marks Beacon disabled (not an outage).
 
-## Endpoints (GET-only; mutaties bestaan niet in v1 namespace)
+## Semantics Hermes relies on
 
-| endpoint | gebruik door Hermes |
-|---|---|
-| `/capabilities` | startup-check |
-| `/summary` | fast-cycle: health/cpu/memory/load/thermal/docker-counts |
-| `/docker` | elke fast-cycle: state/health/image/updateAvailable/composeProject/freshness |
-| `/issues` | fast-cycle: primaire issue-invoer (id, severity, status, firstSeen, suggestedChecks info-only) |
-| `/storage` | reconcile: arrayState/parity/disks+temperatuur |
-| `/system` | reconcile: cpu/load/temps/uptime |
-| `/operations` | deep/daily: automation/update-helper state |
-| `/events?since=&limit=` | reconnect backfill (in-memory, max 100, weg bij restart) |
-| `/stream` | SSE: `hello`, `docker.transition`, `system.health`; ping-comment elke 20s; ring 200; `Last-Event-ID` replay |
-
-## Consument-regels voor Hermes
-
-1. HTTP-status expliciet classificeren (`DISABLED` ≠ 401 ≠ 429 ≠ 5xx ≠ timeout);
-   `DISABLED` = configuratieprobleem → geen alarm-storm, bron gemarkeerd.
-2. `?since=` is een lexicografische ISO-string compare → altijd UTC `toISOString()`.
-3. Stream-reconnect met backoff ≥6s+jitter (10/min-limiet); reconnect → eerst
-   `/events` sinds Last-Event-ID, dan `/docker`-resync (ring is vluchtig).
-4. `stale:true` of oude `ageSeconds` telt niet als "confirm" in evidence.
-5. `/issues` negeert `?status=` (niet geïmplementeerd); filteren aan onze kant.
-6. `/openapi.json` bestaat niet (404) ondanks docs.
-7. Rate-limit bucket = door client gezonden `X-Forwarded-For` — Hermes stuurt
-   die header niet.
+- `docker[].health` may be null (no healthcheck) — never treated as unhealthy.
+- `issues` dedup: Hermes keys on issue `condition` to avoid double-counting
+  native conditions.
+- `arrayState`/`parityStatus` are authoritative strings (e.g. STARTED, IDLE,
+  CANCELLED) shown verbatim in `/status`.

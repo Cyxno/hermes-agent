@@ -64,7 +64,7 @@ class Notifier:
                 return await self._send(chat_id=self.debug_chat_id, text=f"[SHADOW] {text}",
                                         snapshot=snapshot, kind=kind)
             self._record(now, snapshot, kind, "shadow:not sent", 0)
-            info("notifier", "shadow: melding niet verzonden", incident_id=snapshot.get("id"), kind=kind)
+            info("notifier", "shadow: notification not sent", incident_id=snapshot.get("id"), kind=kind)
             return True
         if not self.telegram or not chat_id:
             self._record(now, snapshot, kind, "suppressed:no transport", 0)
@@ -77,7 +77,7 @@ class Notifier:
         try:
             message_id = await self.telegram.send_message(chat_id, text)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001 - delivery failures are retried, not fatal
-            warning("notifier", "telegram verzending gefaald", incident_id=snapshot.get("id"),
+            warning("notifier", "telegram send failed", incident_id=snapshot.get("id"),
                     error=str(exc)[:160])
             self.db.execute(
                 "INSERT INTO notifications(ts, incident_id, severity, kind, message, delivered, attempts, next_retry, meta) "
@@ -89,7 +89,7 @@ class Notifier:
             return False
         self._record(now, snapshot, kind, f"delivered:{message_id}", 1, message_id=message_id, message=text)
         self.counters["sent"] += 1
-        info("notifier", "melding verzonden", incident_id=snapshot.get("id"), kind=kind,
+        info("notifier", "notification sent", incident_id=snapshot.get("id"), kind=kind,
              severity=snapshot.get("severity"), message_id=message_id)
         return True
 

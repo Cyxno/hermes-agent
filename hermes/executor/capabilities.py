@@ -35,41 +35,41 @@ DEFAULT_CAPABILITIES: dict[str, Capability] = {
     cap.name: cap
     for cap in (
         Capability(
-            "docker.restart", "Herstart een bekende managed container", GUARDED,
+            "docker.restart", "Restart a known managed container", GUARDED,
             "docker-restart", verification=("container_running", "container_healthy"),
         ),
         Capability(
-            "docker.start", "Start een gestopte managed container", GUARDED,
+            "docker.start", "Start a stopped managed container", GUARDED,
             "docker-start", verification=("container_running", "container_healthy"),
         ),
         Capability(
-            "docker.stop", "Stopt een managed container (alleen met duidelijke reden)", GUARDED,
-            "docker-stop", verification=("container_stopped",), requires_approval=False,
+            "docker.stop", "Stop a managed container (requires explicit reason)", APPROVAL_REQUIRED,
+            "docker-stop", verification=("container_stopped",), requires_approval=True,
         ),
         Capability(
-            "docker.recreate", "Forceer recreate van een compose-service", FORBIDDEN,
+            "docker.recreate", "Force recreate of a compose service", FORBIDDEN,
             None, requires_approval=True,
         ),
         Capability(
-            "compose.restart", "Herstart een heel compose-project", APPROVAL_REQUIRED,
+            "compose.restart", "Restart an entire compose project", APPROVAL_REQUIRED,
             "docker-compose-restart", requires_approval=True,
         ),
         Capability(
-            "service.restart", "Herstart een allowlisted host-service", GUARDED,
+            "service.restart", "Restart an allowlisted host service", GUARDED,
             "service-restart", verification=("service_running",),
         ),
-        Capability("network.probe", "Basis netwerkdiagnose (lossless, read-only)", SAFE, None,
+        Capability("network.probe", "Basic network diagnostics (lossless, read-only)", SAFE, None,
                    verification=()),
-        Capability("dns.probe", "DNS-resolutie controle (read-only)", SAFE, None, verification=()),
-        Capability("filesystem.inspect", "Filesystem status inspectie (read-only)", SAFE, None,
+        Capability("dns.probe", "DNS resolution check (read-only)", SAFE, None, verification=()),
+        Capability("filesystem.inspect", "Filesystem status inspection (read-only)", SAFE, None,
                    verification=()),
-        Capability("unraid.inspect", "Unraid array/system inspectie (read-only)", SAFE, None,
+        Capability("unraid.inspect", "Unraid array/system inspection (read-only)", SAFE, None,
                    verification=()),
         # Explicit forbidden classes — never executable, present for audit clarity.
-        Capability("fs.delete_content", "Verwijderen van bestanden", FORBIDDEN, None),
-        Capability("disk.format", "Een schijf formatteren", FORBIDDEN, None),
-        Capability("array.stop", "De Unraid-array stoppen", FORBIDDEN, None),
-        Capability("hermes.self_modify", "Hermes eigen code/config muteren", FORBIDDEN, None),
+        Capability("fs.delete_content", "Delete files", FORBIDDEN, None),
+        Capability("disk.format", "Format a disk", FORBIDDEN, None),
+        Capability("array.stop", "Stop the Unraid array", FORBIDDEN, None),
+        Capability("hermes.self_modify", "Mutate Hermes own code/config", FORBIDDEN, None),
     )
 }
 

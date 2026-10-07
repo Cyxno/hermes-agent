@@ -1,33 +1,33 @@
-# Hermes v2 — voorbeeldconfiguratie.
-# Kopieer naar /data/config.yaml (in het persistent volume) en vul het in.
-# Secrets NOOIT hier: gebruik `env:NAAM`-referenties en zet de waarden in de
-# container-omgeving (Unraid template) of /data/secrets.env.
+# Hermes v2 — example configuration.
+# Copy to /data/config.yaml (inside the persistent volume) and fill it in.
+# NEVER put secrets here: use `env:NAME` references and provide the values via
+# the container environment (Unraid template) or /data/secrets.env.
 
-mode: shadow          # shadow | normal  (v2 start altijd in shadow na migratie)
+mode: shadow          # shadow | normal  (v2 always starts in shadow)
 data_dir: /data
 log_level: info
-bind: 127.0.0.1       # health/diagnostics endpoint (alleen lokaal in de container)
+bind: 127.0.0.1       # health/diagnostics endpoint (container-local only)
 port: 8643
 
 sources:
-  beacon:             # PRIMAIRE bron (spec: Beacon = normalization layer)
+  beacon:             # PRIMARY source (Beacon = normalization layer)
     enabled: true
     base_url: http://192.168.1.2:8090
-    token: env:BEACON_AGENT_API_TOKEN   # minimaal 32 tekens; zie docs/MIGRATION.md
-  netdata:            # TWEEDE bron: throttling, iowait, await, anomaly
+    token: env:BEACON_AGENT_API_TOKEN   # minimum 32 chars; see docs/MIGRATION.md
+  netdata:            # SECONDARY source: throttling, iowait, await, anomaly
     enabled: true
     base_url: http://192.168.1.2:19999
-    ml_chart: ""      # optioneel: anomaly_detection.anomaly_rate_on_<machine-guid>
-  fallback:           # ALLEEN als Beacon onbereikbaar is (spec §5)
+    ml_chart: ""      # optional: anomaly_detection.anomaly_rate_on_<machine-guid>
+  fallback:           # ONLY when Beacon is unreachable (spec §5)
     enabled: true
     prometheus_url: http://192.168.1.2:9090
-    ssh_enabled: false          # optionele SSH read-dispatch host-summary
+    ssh_enabled: false          # optional SSH read-dispatch host summary
     ssh_host: ""
     ssh_key_path: ""
     ssh_known_hosts: ""
 
-# Per-categorie bevestigingsvensters in seconden (spec §8). Band-metrics
-# (drempel-metrics) gebruiken de `sustains`-vensters hieronder; hun debounce is 0.
+# Per-category confirmation windows in seconds (spec §8). Band metrics
+# (threshold metrics) use the `sustains` windows below; their debounce is 0.
 debounce:
   container_unhealthy: 90
   container_exit: 45
@@ -39,7 +39,7 @@ debounce:
   array_parity_fault: 0         # immediate, high urgency
   host_unreachable: 60
 
-sustains:            # hoe lang een drempel overtreden moet zijn vóór een band opent (§9)
+sustains:            # how long a threshold must be violated before a band opens (§9)
   host_cpu_pct: 300
   host_memory_pct: 300
   host_package_temp_c: 600
@@ -53,7 +53,7 @@ sustains:            # hoe lang een drempel overtreden moet zijn vóór een band
 hysteresis:
   default: {clear_margin_pp: 5, good_samples: 2}
   overrides:
-    host_cpu_pct: {clear_margin_pp: 15, good_samples: 3}   # open >85, clear <70 (§9-voorbeeld)
+    host_cpu_pct: {clear_margin_pp: 15, good_samples: 3}   # open >85, clear <70 (§9 example)
 
 thresholds:
   host_memory_pct: {warn: 90, crit: 95}
@@ -67,18 +67,18 @@ thresholds:
   net_errors_per_s: {warn: 1, crit: 10}
   anomaly_rate: {warn: 0.05, crit: 0.25}
 
-cooldowns:           # notificatie-beleid in minuten (first / repeat reminder)
+cooldowns:           # notification policy in minutes (first / repeat reminder)
   warning: {first: 720, repeat: 1440}
   urgent: {first: 240, repeat: 480}
   critical: {first: 240, repeat: 720}
 
-transients: {window: 21600, threshold_default: 5}   # 5x transient in 6u -> pattern-incident
+transients: {window: 21600, threshold_default: 5}   # 5x transient in 6h -> pattern incident
 correlation: {storage_window: 600, storage_min_entities: 3}
 
-desired_state:       # service lifecycle (spec §14) — persistent in de db
+desired_state:       # service lifecycle (spec §14) — persisted in the db
   managed: [plex, sonarr, radarr, postgres, immich_server, netdata]
   optional: []
-  retired: [DUMB, decypharr]     # afwezigheid is normaal
+  retired: [DUMB, decypharr]     # absence is normal
   ignored: []
 
 ai:
@@ -92,32 +92,38 @@ ai:
   max_calls_per_day: 8
 
 executor:
-  mode: dry-run       # disabled | dry-run | guarded  (veilige default: dry-run)
+  mode: dry-run       # disabled | dry-run | guarded  (safe default: dry-run)
+  real_actions_enabled: false   # kill switch: guarded behaves as dry-run when false
+  protected_targets: [hermes-v2, unraid-dashboard, netdata]  # never touched
+  target_cooldown_seconds: 900        # per target, between real actions
+  max_attempts_per_target_hour: 3
+  max_attempts_per_target_day: 6
+  max_concurrent_real_actions: 1
   transport: ssh-operator
-  ssh_host: ""        # leeg = geen transport; v2 mount bewust GEEN docker.sock
+  ssh_host: ""        # empty = no transport; v2 deliberately mounts NO docker.sock
   ssh_key_path: ""
   ssh_known_hosts: ""
   max_attempts_per_incident: 2
-  approval_ttl: 600   # scoped goedkeuring ("los het op") geldt 10 min, eenmalig
+  approval_ttl: 600   # scoped approval ("los het op") is valid 10 min, single use
 
 telegram:
   enabled: true
   bot_token: env:TELEGRAM_BOT_TOKEN
   home_chat_id: env:TELEGRAM_HOME_CHAT_ID
-  debug_chat_id: ""   # optioneel apart (debug)kanaal in shadow mode
+  debug_chat_id: ""   # optional separate (debug) channel in shadow mode
   allowed_usernames: [remco]
-  allowed_user_ids: []      # robuuster dan usernames; Telegram user-id van de eigenaar
+  allowed_user_ids: []      # more robust than usernames; the owner's Telegram user id
   allowed_chat_ids: []
-  min_severity: warning     # notice wordt NOOIT verzonden
-  notify_recovery: true     # recovery alleen na eerdere alert (afgedwongen)
+  min_severity: warning     # notice is NEVER sent
+  notify_recovery: true     # recovery only after an earlier alert (enforced)
   daily_summary_hour: 8
   poll_timeout: 50
 
 scheduler:
   fast_interval: 60       # Beacon summary/issues/docker + SSE events
-  reconcile_interval: 300 # docker/storage/system/issues + netdata-enzymes
+  reconcile_interval: 300 # docker/storage/system/issues + netdata enrichment
   baseline_interval: 900  # baselines/trends
-  daily_hour: 4           # onderhoud + retentie (UTC)
+  daily_hour: 4           # maintenance + retention (UTC)
 
 retention:
   signals_days: 14

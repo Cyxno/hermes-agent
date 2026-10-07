@@ -79,7 +79,7 @@ class CommandHandler:
             ok, username = self._authorize(message)
             chat_id = str(message.get("chat", {}).get("id", ""))
             if not ok:
-                warning("telegram", "niet-geautoriseerd commando geweigerd", username=sanitize(username, 40))
+                warning("telegram", "unauthorized command rejected", username=sanitize(username, 40))
                 await self._reply(chat_id, "Niet geautoriseerd.")
                 continue
             try:
@@ -95,7 +95,7 @@ class CommandHandler:
         try:
             await self.telegram.send_message(chat_id, text)
         except Exception as exc:  # noqa: BLE001
-            warning("telegram", "reply gefaald", error=sanitize(exc, 120))
+            warning("telegram", "reply failed", error=sanitize(exc, 120))
 
     # -- dispatch ---------------------------------------------------------
     async def handle(self, text: str, username: str) -> str:
@@ -163,6 +163,22 @@ class CommandHandler:
         lines = []
         for inc in open_inc[-15:]:
             flag = " [gecorreleerd]" if inc.suppressed else ""
+            # §C25: compact remediation marks where useful
+            rem = self.app.db.one(
+                "SELECT outcome FROM remediations WHERE incident_id=? ORDER BY ts DESC LIMIT 1",
+                (inc.id,),
+            )
+            if rem:
+                if rem["outcome"] in ("resolved", "success"):
+                    flag += " [self-healed]"
+                elif rem["outcome"] == "needs_approval":
+                    flag += " [awaiting approval]"
+                else:
+                    flag += " [remediation attempted]"
+            elif self.app.db.one(
+                "SELECT id FROM action_audit WHERE incident_id=? LIMIT 1", (inc.id,)
+            ):
+                flag += " [remediation attempted]"
             lines.append(f"- `{inc.id}` {inc.severity}/{inc.state}{flag} — {inc.title[:90]}")
         return "\n".join(lines)
 
@@ -287,6 +303,17 @@ class CommandHandler:
         for row in rows:
             ts = datetime.datetime.fromtimestamp(row["ts"], datetime.UTC).strftime("%H:%M")
             lines.append(f"- {ts} [{row['mode']}] {row['capability']} {row['target']} → {row['result']} ({row['initiator']})")
+        # §C23: fold in remediation outcomes (verified success/failure)
+        rem = self.app.db.query(
+            "SELECT ts, incident_id, runbook, outcome, detail FROM remediations "
+            "WHERE ts >= ? ORDER BY ts DESC LIMIT 6",
+            (since,),
+        )
+        if rem:
+            lines.append("Zelfherstel laatste 24u:")
+            for row in rem:
+                ts = datetime.datetime.fromtimestamp(row["ts"], datetime.UTC).strftime("%H:%M")
+                lines.append(f"- {ts} {row['incident_id']} ({row['runbook']}) → {row['outcome']}: {row['detail'][:60]}")
         return "\n".join(lines)
 
     def _mute(self, fingerprint: str, hours: str) -> str:
