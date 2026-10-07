@@ -114,6 +114,18 @@ class EvaluationPipeline:
             state.sources["netdata"] = netdata_stamp
             if result.data:
                 state.netdata_alarms = result.data.get("alarms", [])
+            if netdata_stamp.ok and (state.host.cpu_pct is None or state.host.mem_pct is None):
+                # Beacon levert de host-percentages momenteel niet (summary
+                # cpu/memory = null); Netdata is dan de secundaire bron.
+                try:
+                    if state.host.cpu_pct is None:
+                        state.host.cpu_pct = await self.netdata.host_cpu_pct()
+                    if state.host.mem_pct is None:
+                        state.host.mem_pct = await self.netdata.host_mem_pct()
+                    if state.host.cpu_pct is not None or state.host.mem_pct is not None:
+                        state.host.netdata = netdata_stamp
+                except Exception as exc:  # noqa: BLE001 - fallback mag nooit de cycle breken
+                    warning("pipeline", "netdata host-metrics gefaald", error=str(exc)[:120])
         else:
             netdata_stamp.disabled = True
             state.sources["netdata"] = netdata_stamp
@@ -275,10 +287,44 @@ class EvaluationPipeline:
     # ------------------------------------------------------------------
     # cycle
     # ------------------------------------------------------------------
+    # Slow velden: verzameld op reconcile/baseline, maar elke cycle nodig.
+    # "niet verzameld deze cycle" != "bekend afwezig": een fast cycle mag een
+    # vers niet-verzameld veld niet op None zetten.
+    _SLOW_BEACON_STORAGE = ("array_state", "parity_status", "disks", "storage_used_pct")
+    _SLOW_NETDATA_ENRICH = ("iowait_pct", "disk_await_ms")
+    SLOW_STALE_AFTER = 1800.0  # daarna telt last-known niet meer als vers
+
+    def _carry_forward(self, previous: NormalizedState | None, state: NormalizedState, kind: str) -> NormalizedState:
+        if previous is None:
+            return state
+        prev_host, host = previous.host, state.host
+        if kind != "reconcile":
+            # Beacon storage wordt alleen op reconcile gepolld
+            for field in self._SLOW_BEACON_STORAGE:
+                value = getattr(prev_host, field)
+                if value and not getattr(host, field):
+                    setattr(host, field, value)
+                    ts = prev_host.slow_ts.get(field)
+                    if ts:
+                        host.slow_ts[field] = ts
+        if kind == "fast":
+            for field in self._SLOW_NETDATA_ENRICH:
+                value = getattr(prev_host, field)
+                if value and not getattr(host, field):
+                    setattr(host, field, value)
+                    ts = prev_host.slow_ts.get(field)
+                    if ts:
+                        host.slow_ts[field] = ts
+        for field in (*self._SLOW_BEACON_STORAGE, *self._SLOW_NETDATA_ENRICH):
+            if getattr(host, field):
+                host.slow_ts.setdefault(field, state.ts)
+        return state
+
     async def run_cycle(self, kind: str) -> dict:
         started = self.clock.monotonic()
         now = self.clock.now()
         state = await self.collect(kind)
+        state = self._carry_forward(self.last_state, state, kind)
         self.last_state = state
         signals = self.rules.evaluate(state, now)
         self.engine.ingest(signals)

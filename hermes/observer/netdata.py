@@ -147,3 +147,33 @@ class NetdataClient:
 
     async def oom_kills(self) -> float | None:
         return await self.chart_max("mem.oom_kill", "kills", after=-600)
+
+    async def host_cpu_pct(self) -> float | None:
+        """Total host CPU utilization % (som van de system.cpu-dimensies; de
+        chart is gestacked utilization, idle ontbreekt als dimensie)."""
+        data = await self._get("/data", {
+            "chart": "system.cpu", "points": 1, "group": "average", "options": "absolute",
+        })
+        rows = data.get("data") or []
+        if not rows:
+            return None
+        values = [v for v in rows[0][1:] if isinstance(v, (int, float))]
+        if not values:
+            return None
+        return round(min(sum(values), 100.0), 1)
+
+    async def host_mem_pct(self) -> float | None:
+        """Host RAM % = used / (free+used+cached+buffers) uit system.ram (MiB)."""
+        data = await self._get("/data", {
+            "chart": "system.ram", "points": 1, "group": "average", "options": "absolute",
+        })
+        rows = data.get("data") or []
+        labels = data.get("labels") or []
+        if not rows or len(labels) < 2:
+            return None
+        parts = dict(zip(labels[1:], rows[0][1:], strict=False))
+        total = sum(v for v in parts.values() if isinstance(v, (int, float)))
+        used = parts.get("used")
+        if not total or not isinstance(used, (int, float)):
+            return None
+        return round(used / total * 100, 1)

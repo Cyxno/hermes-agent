@@ -223,10 +223,18 @@ class HermesApp:
         host = self.pipeline.last_state.host if self.pipeline.last_state else None
         lines = [f"Hermes v2 — {version_info()['version']} ({version_info()['git_sha'][:10]})"]
         if host is not None:
+            # langzaam verzamelde velden: alleen tonen als last-known vers is
+            # (carry-forward houdt ze levend; na SLOW_STALE_AFTER valt het terug
+            # naar "?" in plaats van een stille oude waarde)
+            def slow_fresh(field: str) -> bool:
+                ts = host.slow_ts.get(field)
+                return ts is None or (now - ts) <= self.pipeline.SLOW_STALE_AFTER
+
             cpu = f"{host.cpu_pct:.0f}%" if host.cpu_pct is not None else "?"
             mem = f"{host.mem_pct:.0f}%" if host.mem_pct is not None else "?"
             temp = f"{host.package_temp_c:.0f}°C" if host.package_temp_c is not None else "?"
-            lines.append(f"Host: CPU {cpu}, RAM {mem}, {temp}, array={host.array_state or '?'}")
+            array = host.array_state if (host.array_state and slow_fresh("array_state")) else "?"
+            lines.append(f"Host: CPU {cpu}, RAM {mem}, {temp}, array={array}")
         beacon = self.pipeline.last_state.source("beacon") if self.pipeline.last_state else None
         if beacon is not None:
             age = int(now - beacon.ts) if beacon.ts else -1

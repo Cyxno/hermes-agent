@@ -73,6 +73,7 @@ class HostView:
     beacon: SourceStamp | None = None
     netdata: SourceStamp | None = None
     fallback: SourceStamp | None = None
+    slow_ts: dict = field(default_factory=dict)  # slow-field -> last observed ts (runtime)
 
 
 @dataclass

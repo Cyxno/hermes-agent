@@ -191,3 +191,32 @@ def audit_ai_call(db, clock, incident_id: str | None, tier: int, model: str, pur
         warning("ai", "audit write failed", error=sanitize(exc, 120))
     info("ai", "call", tier=tier, model=model, purpose=purpose, result=result,
          incident_id=incident_id, confidence=confidence)
+
+
+def ai_usage_for_incident(db, incident_id: str) -> dict | None:
+    """Incident-scoped AI-metadata uit de bestaande ai_calls-audit.
+
+    Source of truth is uitsluitend de audit-tabel: puur lokaal, vrijwel
+    kosteloos, en veroorzaakt nooit een AI-call. Semantiek:
+    - minstens één succesvolle call -> used, met model/tier van de laatste
+      succesvolle call;
+    - alleen gefaalde calls -> used + failed (analyse mislukt);
+    - geen enkele call -> None (AI gebruikt: nee).
+    """
+    try:
+        ok_row = db.one(
+            "SELECT model, tier FROM ai_calls WHERE incident_id=? AND result='ok' "
+            "ORDER BY id DESC LIMIT 1",
+            (incident_id,),
+        )
+        if ok_row:
+            return {"used": True, "model": ok_row["model"],
+                    "tier": int(ok_row["tier"] or 0), "failed": False}
+        any_row = db.one(
+            "SELECT model FROM ai_calls WHERE incident_id=? LIMIT 1", (incident_id,)
+        )
+        if any_row:
+            return {"used": True, "model": None, "tier": None, "failed": True}
+    except Exception as exc:  # noqa: BLE001 - metadata mag nooit het pad breken
+        warning("ai", "ai_usage lookup gefaald", error=sanitize(exc, 120))
+    return None

@@ -191,3 +191,16 @@ class AIRouter:
             escalated = reason
             info("ai", "escalatie naar tier2", incident_id=incident_id, reason=reason)
             tier, model = 2, self.tier2
+
+
+MODEL_DISPLAY_NAMES = {
+    "google/gemini-2.5-flash-lite": "Gemini 2.5 Flash-Lite",
+    "deepseek/deepseek-v4-flash-0731": "DeepSeek V4 Flash",
+}
+
+
+def model_display_name(model: str | None) -> str:
+    """Nette display-name voor meldingen; audit behoudt de volledige slug."""
+    if not model:
+        return "?"
+    return MODEL_DISPLAY_NAMES.get(model, model)

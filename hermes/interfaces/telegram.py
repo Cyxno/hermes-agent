@@ -82,17 +82,33 @@ class TelegramClient:
             self._session = None
 
 
+def _ai_usage_line(snapshot: dict) -> str:
+    """'AI gebruikt'-regel uit de incident-scoped audit-metadata (geen AI-calls)."""
+    from ..intelligence.router import model_display_name
+
+    usage = snapshot.get("ai_usage")
+    if not usage or not usage.get("used"):
+        return "AI gebruikt: nee"
+    if usage.get("failed"):
+        return "AI gebruikt: ja — analyse mislukt"
+    name = model_display_name(usage.get("model"))
+    tier = f" (tier {usage['tier']})" if int(usage.get("tier") or 0) >= 2 else ""
+    return f"AI gebruikt: ja — {name}{tier}"
+
+
 def format_alert(kind: str, snapshot: dict, affected: list[str] | None = None,
                  ai_explanation: str | None = None) -> str:
     """Deterministic alert text — no LLM involved (spec §15)."""
     icons = {"notice": "ℹ️", "warning": "⚠️", "urgent": "🟠", "critical": "🔴"}
     severity = snapshot.get("severity", "warning")
     icon = icons.get(severity, "⚠️")
+    ai_line = _ai_usage_line(snapshot)
     if kind == "resolved":
         return (
             f"✅ OPGELOST — {snapshot.get('title')}\n"
             f"Incident: `{snapshot.get('id')}`\n"
-            f"Duur: {snapshot.get('duration')}"
+            f"Duur: {snapshot.get('duration')}\n"
+            f"{ai_line}"
         )
     if kind == "reminder":
         header = f"{icon} NOG ACTIEF — {snapshot.get('title')}"
@@ -110,6 +126,7 @@ def format_alert(kind: str, snapshot: dict, affected: list[str] | None = None,
         ))
     if affected:
         lines.append("Getroffen: " + ", ".join(affected[:10]))
+    lines.append(ai_line)
     if ai_explanation:
         lines.append("")
         lines.append(f"AI-analyse: {sanitize(ai_explanation, 600)}")

@@ -507,8 +507,11 @@ class IncidentEngine:
 
     # ------------------------------------------------------------------
     def incident_snapshot(self, incident: Incident) -> dict[str, Any]:
+        from ..intelligence.provider import ai_usage_for_incident
+
         return {
             "id": incident.id,
+            "ai_usage": ai_usage_for_incident(self.db, incident.id),
             "category": incident.category,
             "entity": incident.entity,
             "title": incident.title,
