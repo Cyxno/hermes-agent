@@ -72,3 +72,30 @@ normal expected mechanism.
    (existing incidents keep their notification bookkeeping).
 4. Executor defaults stay safe: upgrades never change the configured
    executor mode or `real_actions_enabled`.
+
+## Normal path (definitive, 2026-10-07)
+
+```text
+1. prepare version  → bump pyproject (single source of truth)
+2. merge/test main  → ci.yml (pytest, ruff, build sanity) must be green
+3. create immutable tag → git tag vX.Y.Z && git push origin vX.Y.Z
+4. GitHub Actions validates   → tag==version gate + immutable-tag preflight
+5. GitHub Actions tests       → pytest + ruff
+6. GitHub Actions publishes   → GHCR (see tag matrix below)
+7. stable tags only for stable versions (rc never moves `latest`/`X.Y`)
+```
+
+- `release.yml` also accepts `workflow_dispatch` for a **non-publishing**
+  validation run (build sanity only) — the safe way to prove the pipeline.
+- GitHub Releases: stable tags create a full release; prereleases (tags with
+  `-`) are marked as prerelease.
+- Permissions: `contents: write` (release notes) + `packages: write` (GHCR) —
+  nothing more.
+
+## Emergency fallback (only when Actions demonstrably fails)
+
+Manual build+push with workflow-identical arguments (see below) is an
+**emergency exception**, never the normal procedure. Document every manual
+release. History: Actions ran for the first time on 2026-10-07 after the
+repository-level Actions switch was enabled; v2.1.5-rc.1 was the first
+pipeline-published artifact.

@@ -1,4 +1,7 @@
-name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |name: release
 
 # Stable release pipeline. Pushing an immutable tag vMAJOR.MINOR.PATCH runs:
 # gate (tag == pyproject version) -> tests -> lint -> build -> GHCR publish
@@ -30,13 +33,18 @@ jobs:
       - name: Release preflight — immutable tag policy (never move a published tag)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          # A tag that already exists remotely must NEVER be rebuilt/re-pushed.
-          # A broken release is fixed by the next patch version (docs/RELEASE.md).
-          if git ls-remote --tags origin "refs/tags/${GITHUB_REF_NAME}" | grep -q .; then
-            echo "REFUSING: tag ${GITHUB_REF_NAME} already exists remotely (immutable tag policy)."
+          # A normal tag push creates the remote tag, so "tag exists" alone is
+          # NOT a violation. A violation is a MOVED tag: the tag on the remote
+          # no longer points at the commit this run was triggered for.
+          # (Annotated tags: dereference with ^{} to compare the commit.)
+          REMOTE_SHA=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}^{}" | awk '{print $1}')
+          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "${GITHUB_SHA}" ]; then
+            echo "REFUSING: tag ${GITHUB_REF_NAME} was moved remotely (immutable tag policy)."
+            echo "Remote tag points at ${REMOTE_SHA:-none}; this build is ${GITHUB_SHA}."
             echo "Release the next patch version instead."
             exit 1
           fi
+          echo "preflight OK: tag ${GITHUB_REF_NAME} still points at ${GITHUB_SHA}"
 
       - name: Verify tag matches version (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/')
