@@ -135,6 +135,9 @@ DEFAULTS: dict[str, Any] = {
         # master kill switch: when False, guarded mode behaves as dry-run.
         # Flip back to dry-run-safe without rebuilding (2.1 §E4).
         "real_actions_enabled": False,
+        # automatic runbook execution for confirmed incidents (§E3); the
+        # executor guards (mode/kill switch/budgets/protection) still apply
+        "auto_remediate": True,
         # targets Hermes may never touch, regardless of lifecycle/registry
         "protected_targets": [],
         # restart-loop prevention: budgets are enforced from the persistent

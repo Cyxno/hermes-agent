@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.2 (2026-10-07)
+
+- Automatic guarded self-healing trigger: confirmed incidents (warning+) with
+  a known action runbook now enter the executor automatically (once per
+  incident per hour, one candidate per cycle). With dry-run or the kill
+  switch off this records would_execute decisions (Stage 0 review); with
+  guarded + real_actions_enabled the executor guards decide.
+- Completes the 2.1.0 guarded feature (the trigger was missing).
+
 ## 2.1.1 (2026-10-07)
 
 - Image: add openssh-client — the guarded executor dispatches through the

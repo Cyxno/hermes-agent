@@ -340,8 +340,49 @@ class HermesApp:
                     self.metrics.last_beacon_ok = time.time()
                 if stamps.get("netdata", {}).get("ok"):
                     self.metrics.last_netdata_ok = time.time()
+                if kind == "fast":
+                    await self._auto_remediation()
             except Exception as exc:  # noqa: BLE001 - a broken cycle must not kill the daemon
                 error("daemon", "cycle faalde", kind=kind, error=str(exc)[:200])
+
+    async def _auto_remediation(self) -> None:
+        """2.1 §E3: automatic guarded self-healing for confirmed incidents with
+        a known action runbook. Safety is layered: the executor enforces the
+        kill switch (`real_actions_enabled`), mode (dry-run default), MANAGED
+        lifecycle, protection, budgets, idempotency, concurrency, root-cause
+        suppression and a fresh pre-execution recheck. With dry-run or the
+        switch off this records would_execute decisions for review (Stage 0).
+        Notice-severity incidents are never auto-remediated; max one attempt
+        per incident per hour and one candidate per cycle (§C16)."""
+        exec_cfg = self.cfg.section("executor")
+        if exec_cfg["mode"] == "disabled" or not exec_cfg.get("auto_remediate", True):
+            return
+        for inc in self.engine.open_incidents():
+            if inc.state != "CONFIRMED" or inc.suppressed:
+                continue
+            from .evaluator.pipeline import SEVERITY_RANK
+
+            if SEVERITY_RANK.get(inc.severity, 1) < 1:  # notice: never automatic
+                continue
+            recent = self.db.one(
+                "SELECT id FROM remediations WHERE incident_id=? AND ts > ?",
+                (inc.id, self.clock.now() - 3600),
+            )
+            audit = self.db.one(
+                "SELECT id FROM action_audit WHERE incident_id=? AND ts > ?",
+                (inc.id, self.clock.now() - 3600),
+            )
+            if recent or audit:
+                continue  # once per hour per incident
+            runbook = self.runbooks.for_incident(inc)
+            if runbook is None or not runbook.actions:
+                continue
+            info("remediation", "automatic runbook start",
+                 incident_id=inc.id, runbook=runbook.name, initiator="automatic")
+            result = await self.runbooks.run(inc, initiator="automatic")
+            info("remediation", "automatic runbook done", incident_id=inc.id,
+                 outcome=result.outcome, detail=result.detail[:140])
+            return  # §C16: at most one candidate per cycle
 
     async def _loop(self, name: str, interval: float, coro_factory) -> None:  # noqa: ANN001
         await asyncio.sleep(min(5.0, interval))
