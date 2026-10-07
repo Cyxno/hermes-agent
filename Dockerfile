@@ -16,6 +16,12 @@ COPY pyproject.toml README.md ./
 COPY hermes ./hermes
 RUN pip install --no-cache-dir .
 
+# openssh-client: the guarded executor dispatches through the hardened SSH
+# operator (fixed argv verbs, no shell); no docker.sock is ever mounted
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # dedicated service user (matches the legacy Hermes uid so /data ownership
 # migrates 1:1 on the Unraid host)
 RUN useradd --uid 10000 --user-group --home-dir /data --shell /usr/sbin/nologin hermes \

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.1 (2026-10-07)
+
+- Image: add openssh-client — the guarded executor dispatches through the
+  hardened SSH operator (fixed argv verbs); required for real remediation.
+  No code changes.
+
 ## 2.1.0 (2026-10-07)
 
 - Guarded self-healing: `container_restart`/`container_start` may execute for
