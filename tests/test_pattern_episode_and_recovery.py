@@ -41,8 +41,8 @@ async def test_pattern_reopen_preserves_notification_state(stack):
     assert stack["engine"].get(pid).notification_sent
     original_first_seen = stack["engine"].get(pid).first_seen
 
-    # episode gedempt: transients verlopen uit het venster -> tracker lost af,
-    # recovery-intent verschijnt (er is eerder een alert verzonden)
+    # episode cleared: transients age out of the window -> tracker resolves,
+    # recovery intent appears (an alert was sent before)
     stack["db"].execute("UPDATE transients SET ts = ts - ?", (21600 * 2,))
     stack["clock"].advance(10)
     stack["tracker"].check()
@@ -50,8 +50,8 @@ async def test_pattern_reopen_preserves_notification_state(stack):
     resolved = _intents_for(stack["engine"].tick(), "resolved", pid)
     assert len(resolved) == 1
 
-    # nieuwe fling binnen het venster -> heropen als ACTIVE met behouden
-    # boekhouding; GEEN nieuwe alert (de storm-regressie)
+    # new flap within the window -> reopen as ACTIVE, keeping
+    # bookkeeping; NO new alert (the storm regression)
     _add_transients(stack, "container_unhealthy:plex", 5)
     stack["clock"].advance(10)
     stack["tracker"].check()
@@ -69,8 +69,8 @@ async def test_momentary_clear_does_not_resolve_pattern(stack):
     stack["engine"].tick()
     stack["engine"].mark_notified(pid, stack["clock"].now(), "warning")
 
-    # geen live-signalen voor het pattern-incident, maar transients nog in
-    # venster: absence-grace mag het incident NIET resolven (oude storm-bron)
+    # no live signals for the pattern incident, but transients still in
+    # window: absence grace must NOT resolve it (old storm source)
     stack["clock"].advance(600)
     stack["tracker"].check()  # houdt het patroon open (n nog >= drempel)
     stack["engine"].tick()
@@ -87,7 +87,7 @@ async def test_recovery_notification_sent_once_after_alert(stack):
     recoveries = [k for k, _ in stack["notifier"].delivered if k == "resolved"]
     assert len(recoveries) == 1
 
-    # geen tweede recovery als het incident daarna nogmaals een resolve-loop maakt
+    # no second recovery when the incident resolves again later
     await run_cycles(stack, 3)
     recoveries = [k for k, _ in stack["notifier"].delivered if k == "resolved"]
     assert len(recoveries) == 1

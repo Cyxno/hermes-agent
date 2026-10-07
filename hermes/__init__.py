@@ -7,8 +7,8 @@ import os
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
-# pyproject is de enige version source of truth (2.0.1-les: hardcoded
-# VERSION kon uit de pas lopen bij releases)
+# pyproject is the single version source of truth (2.0.1 lesson: a
+# hardcoded VERSION could drift across releases)
 try:
     VERSION = _pkg_version("hermes-agent")
 except PackageNotFoundError:  # uit source-tree zonder install
