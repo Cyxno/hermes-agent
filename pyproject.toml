@@ -1,6 +1,6 @@
 [project]
 name = "hermes-agent"
-version = "2.1.2"
+version = "2.1.3"
 description = "Hermes v2 — stateful, low-noise, AI-assisted autonomous operations agent for Unraid"
 requires-python = ">=3.12"
 dependencies = [

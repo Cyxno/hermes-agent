@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.3 (2026-10-07)
+
+- Auto-remediation now also picks up ACTIVE incidents (post-notification);
+  the CONFIRMED-only window missed the normal alert flow.
+
 ## 2.1.2 (2026-10-07)
 
 - Automatic guarded self-healing trigger: confirmed incidents (warning+) with

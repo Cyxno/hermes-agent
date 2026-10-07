@@ -358,7 +358,9 @@ class HermesApp:
         if exec_cfg["mode"] == "disabled" or not exec_cfg.get("auto_remediate", True):
             return
         for inc in self.engine.open_incidents():
-            if inc.state != "CONFIRMED" or inc.suppressed:
+            # CONFIRMED pre-notification, or ACTIVE post-notification — both
+            # are confirmed, open incidents eligible for one remediation attempt
+            if inc.state not in ("CONFIRMED", "ACTIVE") or inc.suppressed:
                 continue
             from .evaluator.pipeline import SEVERITY_RANK
 
