@@ -20,6 +20,8 @@ class AIRequest:
     system: str
     user: str
     json_mode: bool = True
+    json_schema: dict | None = None  # native structured-output contract (als model het ondersteunt)
+    reasoning_disabled: bool = False  # tier1: goedkoop/voorspelbaar, geen chain-of-thought
     max_tokens: int = 900
     temperature: float = 0.1
 
@@ -33,6 +35,7 @@ class AIResponse:
     tokens_in: int = 0
     tokens_out: int = 0
     provider_error: bool = False  # transport/provider failure vs bad content
+    timeout: bool = False  # expliciete timeout-klasse (Fase 7 result-classificatie)
 
 
 class AIProvider(Protocol):
@@ -76,7 +79,15 @@ class OpenRouterProvider:
             "allow_fallbacks": False,  # router owns escalation; never silent model swaps
         }
         if request.json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            if request.json_schema:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "diagnosis", "strict": False, "schema": request.json_schema},
+                }
+            else:
+                payload["response_format"] = {"type": "json_object"}
+        if request.reasoning_disabled:
+            payload["reasoning"] = {"enabled": False}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -93,9 +104,28 @@ class OpenRouterProvider:
                     detail = ""
                     if isinstance(body, dict):
                         detail = str(body.get("error", ""))[:200]
-                    return AIResponse(model, "", False, f"http {resp.status}: {detail}",
-                                      provider_error=True)
-        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+                    # schema niet ondersteund op dit endpoint: één gestripte
+                    # retry met plain json_object; pydantic blijft het harde contract
+                    if resp.status == 400 and request.json_schema and (
+                        "schema" in detail.lower() or "response_format" in detail.lower()
+                    ):
+                        stripped = dict(payload)
+                        stripped["response_format"] = {"type": "json_object"}
+                        async with session.post(
+                            f"{self.base_url}/chat/completions", json=stripped, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        ) as resp2:
+                            body = await resp2.json(content_type=None)
+                            if resp2.status != 200:
+                                return AIResponse(model, "", False, f"http {resp2.status}: {detail}",
+                                                  provider_error=True)
+                        resp = resp2
+                    else:
+                        return AIResponse(model, "", False, f"http {resp.status}: {detail}",
+                                          provider_error=True)
+        except TimeoutError:
+            return AIResponse(model, "", False, "timeout", provider_error=True, timeout=True)
+        except (aiohttp.ClientError, OSError) as exc:
             return AIResponse(model, "", False, sanitize(exc, 160), provider_error=True)
         usage = body.get("usage") or {}
         try:

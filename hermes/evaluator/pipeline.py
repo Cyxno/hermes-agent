@@ -328,7 +328,7 @@ class EvaluationPipeline:
                     continue
                 delivered = await self.notifier.deliver("resolved", self.engine.incident_snapshot(incident))
                 if delivered:
-                    self.engine.mark_notified(incident.id, self.clock.now(), incident.severity)
+                    self.engine.mark_notified(incident.id, self.clock.now(), incident.severity, kind="resolved")
                     notified += 1
                 continue
             ok, reason = await self.final_recheck(incident)

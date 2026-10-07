@@ -5,7 +5,7 @@ externen expliciet **niet** kunnen, en waar de Grenzen in code zitten.
 
 ## 1. AI heeft geen shell-authoriteit (§23/§65.7)
 
-- De AI (Ling/DeepSeek) produceert hooguit een gevalideerd `Diagnosis`-object met
+- De AI (Gemini/DeepSeek) produceert hooguit een gevalideerd `Diagnosis`-object met
   `proposedActions` — **pydantic-gevalideerd** (`intelligence/schemas.py`):
   capability en target mogen geen shell-metatekens bevatten (`\n\r;|&$\``).
 - Acties gaan altijd via: PolicyEngine → CapabilityGuard → Executor

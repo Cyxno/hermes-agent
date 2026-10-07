@@ -49,3 +49,12 @@ DIAGNOSIS_INSTRUCTION = """Antwoord UITSLUITEND met één JSON-object dat aan di
  "proposedActions": [{"capability": str, "target": str, "args": {}, "reason": str}],
  "requiresEscalation": bool, "requiresHumanApproval": bool, "explanation": str}
 Geen prose buiten de JSON. Gebruik alleen capability-namen uit de lijst."""
+
+
+def diagnosis_json_schema() -> dict:
+    """Native structured-output schema (OpenRouter json_schema) uit het pydantic-model.
+
+    De pydantic-validatie blijft het harde contract; dit schema dwingt het
+    formaat al aan de provider-kant af.
+    """
+    return Diagnosis.model_json_schema()

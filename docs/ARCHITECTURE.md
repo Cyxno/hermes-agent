@@ -20,7 +20,7 @@ Eén Python-daemon (container) die:
 6. bekende problemen deterministisch diagnosticeert via **runbooks**;
 7. waar veilig mogelijk **herstelt** via een executor met capability-registry,
    policy-engine, dry-run en always-verify;
-8. alleen dan **AI** (Ling 3.0 Flash → DeepSeek V4 Flash via OpenRouter) raadpleegt
+8. alleen dan **AI** (Gemini 2.5 Flash-Lite → DeepSeek V4 Flash via OpenRouter) raadpleegt
    wanneer deterministische logica onvoldoende is, met structured output;
 9. alleen relevante, gecontroleerde **meldingen** stuurt (final recheck vóór elke
    verzending; recovery alleen na eerdere alert) en Telegram-commando's beantwoordt.
@@ -43,7 +43,7 @@ Unraid/Prom fallback probe    ─┘                                            
                                         RunbookEngine  ── solved ──▶ Verify ◀──┐     TransientTracker
                                               │ ambiguous                     │           │
                                               ▼                               │           ▼
-                                        AIRouter (Ling→DeepSeek, structured)  │    PatternIncidents
+                                        AIRouter (Gemini→DeepSeek, structured)  │    PatternIncidents
                                               │ ActionPlan                    │
                                               ▼                               │
                                         PolicyEngine → CapabilityGuard        │
@@ -144,7 +144,7 @@ gestructureerd `ambiguous`-antwoord voor de AI-laag.
 
 - Interface: `AIProvider.complete(AIRequest) -> AIResponse` (modulair; OpenRouter-
   implementatie met model-naam config; géén provider-logica elders).
-- Router: tier1 `ling-3.0-flash` → stop bij `confidence ≥ 0.85` én `known_cause` én
+- Router: tier1 `google/gemini-2.5-flash-lite` → stop bij `confidence ≥ 0.85` én `known_cause` én
   niet multi-system; anders tier2 `deepseek-v4-flash` bij een van de deterministische
   escalatiecriteria (lage confidence, invalid/missing structured result, geen passende
   remediation, conflicterende root causes, eerste remediation faalt, multi-subsystem,

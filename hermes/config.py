@@ -120,7 +120,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": "env:OPENROUTER_API_KEY",
-        "tier1_model": "inclusionai/ling-3.0-flash",
+        "tier1_model": "google/gemini-2.5-flash-lite",
         "tier2_model": "deepseek/deepseek-v4-flash-0731",
         "confidence_stop": 0.85,
         "max_calls_per_incident": 3,
@@ -146,6 +146,7 @@ DEFAULTS: dict[str, Any] = {
         "debug_chat_id": "",
         "allowed_usernames": [],
         "allowed_chat_ids": [],
+        "allowed_user_ids": [],
         "min_severity": "warning",
         "notify_recovery": True,
         "daily_summary_hour": 8,
@@ -215,6 +216,11 @@ def _apply_env_overrides(cfg: dict) -> list[str]:
     if allowed:
         cfg.setdefault("telegram", {})["allowed_usernames"] = [
             u.strip().lstrip("@") for u in allowed.split(",") if u.strip()
+        ]
+    allowed_ids = os.environ.get("HERMES_TG_ALLOWED_USER_IDS", "")
+    if allowed_ids:
+        cfg.setdefault("telegram", {})["allowed_user_ids"] = [
+            u.strip() for u in allowed_ids.split(",") if u.strip()
         ]
     return applied
 

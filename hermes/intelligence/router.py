@@ -1,5 +1,5 @@
-"""AI router: Ling 3.0 Flash first, DeepSeek V4 Flash only on deterministic
-escalation criteria (spec §15/§17).
+"""AI router: Gemini 2.5 Flash-Lite (tier 1) first, DeepSeek V4 Flash only on
+deterministic escalation criteria (spec §15/§17).
 
 Escalation is never a feeling — it is a boolean derived from: low confidence,
 invalid structured output, no remediation found, multiple root causes, a failed
@@ -15,7 +15,7 @@ from ..clock import Clock
 from ..log import info, warning
 from ..util import sanitize
 from .provider import AIProvider, AIRequest, audit_ai_call, extract_json
-from .schemas import DIAGNOSIS_INSTRUCTION, Diagnosis
+from .schemas import DIAGNOSIS_INSTRUCTION, Diagnosis, diagnosis_json_schema
 
 SYSTEM_PROMPT = (
     "Je bent Hermes, een deterministic-first operations agent voor een Unraid-server. "
@@ -57,7 +57,7 @@ class AIRouter:
         self.provider = provider
         self.db = db
         self.clock = clock
-        self.tier1 = config.get("tier1_model", "inclusionai/ling-3.0-flash")
+        self.tier1 = config.get("tier1_model", "google/gemini-2.5-flash-lite")
         self.tier2 = config.get("tier2_model", "deepseek/deepseek-v4-flash-0731")
         self.confidence_stop = float(config.get("confidence_stop", 0.85))
         self.max_per_incident = int(config.get("max_calls_per_incident", 3))
@@ -132,15 +132,30 @@ class AIRouter:
         tier_attempts = {1: 0, 2: 0}
         escalated: str | None = None
         while True:
+            # budget geldt per provider-call: escalaties en retries tellen mee
+            available, why = self.budget_available(incident_id)
+            if not available:
+                return RouteOutcome(None, tier, model, escalated_from="tier1" if tier == 2 else None,
+                                    escalation_reason=escalated, error=why)
             tier_attempts[tier] += 1
-            request = AIRequest(system=SYSTEM_PROMPT, user=user)
+            request = AIRequest(
+                system=SYSTEM_PROMPT, user=user,
+                json_schema=diagnosis_json_schema(),
+                reasoning_disabled=(tier == 1),  # tier1: goedkoop en voorspelbaar
+            )
             response = await self.provider.complete(request, model)
             if not response.ok:
+                result = "timeout" if response.timeout else "provider_error"
                 audit_ai_call(self.db, self.clock, incident_id, tier, model, "diagnose",
-                              request, response, "provider_error", None)
+                              request, response, result, None)
                 if tier_attempts[tier] == 1:
                     continue  # transient provider failure: one retry same tier
-                return RouteOutcome(None, tier, model, escalated_from="ling" if tier == 2 else None,
+                if tier == 1:
+                    # provider error/timeout na retry = escalatie-grond (spec §17)
+                    escalated = escalated or ("timeout" if response.timeout else "provider_error")
+                    tier, model = 2, self.tier2
+                    continue
+                return RouteOutcome(None, tier, model, escalated_from="tier1" if tier == 2 else None,
                                     escalation_reason=escalated, error=response.error)
             data = extract_json(response.content)
             diagnosis = None
@@ -162,14 +177,14 @@ class AIRouter:
                     escalated = escalated or "invalid_output"
                     tier, model = 2, self.tier2
                     continue
-                return RouteOutcome(None, tier, model, escalated_from="ling",
+                return RouteOutcome(None, tier, model, escalated_from="tier1",
                                     escalation_reason=escalated or "invalid_output",
                                     error="geen geldig structured result")
             reason = self.escalation_reason(
                 diagnosis, False, multi_subsystem, remediation_failed, policy_denied
             )
             if tier == 2:
-                return RouteOutcome(diagnosis, 2, model, escalated_from="ling",
+                return RouteOutcome(diagnosis, 2, model, escalated_from="tier1",
                                     escalation_reason=escalated or reason)
             if reason is None:
                 return RouteOutcome(diagnosis, 1, model)

@@ -19,8 +19,8 @@ low-noise, AI-assisted operations agent:
 - **desired-state lifecycle** (MANAGED/OPTIONAL/RETIRED/IGNORED) i.p.v. hardcoded
   containerverwachtingen — DUMBscope/Decypharr-legacy is verwijderd;
 - **deterministische runbooks** voor diagnose + veilige remediëring;
-- **AI alleen indien nodig**: Ling 3.0 Flash → (deterministische escalatiecriteria)
-  → DeepSeek V4 Flash, structured output (pydantic), hard budget, volledig geauditeerd;
+- * **AI alleen indien nodig**: Gemini 2.5 Flash-Lite → (deterministische escalatiecriteria)
+  → DeepSeek V4 Flash, structured output (pydantic + native JSON-schema), hard budget, volledig geauditeerd;
 - **executor** met capability-registry (FORBIDDEN-klassen onmogelijk), policy-engine,
   scoped goedkeuringen ("los het op"), standaard **dry-run**, altijd verifiëren
   (exit-code 0 is nooit "fixed");
@@ -58,3 +58,14 @@ hermes validate-config
 `git tag vX.Y.Z` → GitHub Actions: lint → tests → build → push
 `ghcr.io/cyxno/hermes-agent:{version,major.minor,latest}` + release notes met
 git SHA/build-tijd. Tag moet overeenkomen met `pyproject.toml` (afgedwongen).
+
+## Telegram-authorization (interactie)
+
+- `home_chat_id` is de **trusted interaction chat**: een privé-chat met die id
+  mag commando's sturen. Is de home-chat een groep/supergroup, dan moeten
+  gebruikers daarnaast expliciet in `allowed_user_ids` of `allowed_usernames` staan.
+- `allowed_user_ids` (Telegram user-id, robuuster dan een username),
+  `allowed_chat_ids` en `allowed_usernames` geven aanvullend toegang via exacte match.
+- **Telegram authorization ≠ execution authorization**: wie mag praten, mag
+  nog niet muteren. De executor staat standaard op `dry-run`; AI-adviezen zijn
+  altijd suggestions die via policy + capability registry lopen.

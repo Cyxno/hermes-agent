@@ -47,6 +47,7 @@ class Incident:
     ai_summary: str | None = None
     evidence: list[dict] = field(default_factory=list)
     recovering_since: float | None = None  # runtime (persisted via evidence meta)
+    notified_active: bool = False  # runtime: alert actief zonder recovery er nog na
 
     @property
     def open(self) -> bool:
@@ -73,6 +74,7 @@ class Incident:
             last_notified_severity=row["last_notified_severity"],
             suppressed=bool(row["suppressed"]), root_incident=row["root_incident"],
             ai_summary=row["ai_summary"] if "ai_summary" in row.keys() else None,
+            notified_active=bool(row["notification_sent"]),
             evidence=json_loads(row["evidence"], []) or [],
         )
 
@@ -293,7 +295,7 @@ class IncidentEngine:
                     # live-signaal; de tracker lost ze af wanneer het venster
                     # leeg raakt (een momentane clear is geen episode-einde)
                     self._transition(incident, "RECOVERING", "geen signalen meer", incident.severity, now)
-                elif incident.notification_sent and incident.last_notified_at and (
+                elif incident.notified_active and incident.last_notified_at and (
                     now - incident.last_notified_at
                     >= self._repeat_cooldown(incident.severity) * 60  # cooldowns in minuten
                 ):
@@ -317,13 +319,16 @@ class IncidentEngine:
         return float(cd.get("repeat", 480))
 
     # ------------------------------------------------------------------
-    def mark_notified(self, incident_id: str, ts: float, severity: str) -> None:
+    def mark_notified(self, incident_id: str, ts: float, severity: str, kind: str = "alert") -> None:
         incident = self._incidents.get(incident_id)
         if incident is None:
             return
         incident.notification_sent = True
         incident.last_notified_at = ts
         incident.last_notified_severity = severity
+        # een verzonden recovery sluit de alert-episode af; reminders/recovery
+        # vereisen daarna een NIEUWE alert
+        incident.notified_active = kind != "resolved"
         if incident.state == "CONFIRMED":
             self._transition(incident, "ACTIVE", "notificatie verzonden", severity, ts)
         else:
@@ -402,6 +407,7 @@ class IncidentEngine:
             )
             incident.evidence = [{"source": "derived", "confirm": True,
                                   "transient_count": count, "base": fingerprint}]
+            incident.notified_active = False  # heropening is geen nieuwe alert
             self._incidents[pid] = incident
             self._persist(incident, now)
             self._event(pid, now, "RESOLVED", incident.state,
@@ -464,6 +470,7 @@ class IncidentEngine:
         if was_pending:
             self.record_transient(incident, reason)
         elif (from_state in OPEN_STATES and incident.notification_sent
+                and incident.notified_active
                 and self.config.get("telegram", {}).get("notify_recovery", True)):
             # Recovery-notificatie: alleen na eerder verzonden alert (spec §11).
             # De pipeline doet de verplichte final recheck; kwam de conditie

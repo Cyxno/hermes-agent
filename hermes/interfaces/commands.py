@@ -21,15 +21,41 @@ class CommandHandler:
         self.app = app
         self.telegram = telegram
         section = app.cfg.section("telegram")
+        self.home_chat_id = str(section.get("home_chat_id") or "")
         self.allowed_usernames = {u.lower().lstrip("@") for u in section.get("allowed_usernames", [])}
         self.allowed_chat_ids = {str(c) for c in section.get("allowed_chat_ids", [])}
+        self.allowed_user_ids = {str(u) for u in section.get("allowed_user_ids", [])}
         self.last_update_id = 0
 
     # -- auth -------------------------------------------------------------
     def _authorize(self, message: dict) -> tuple[bool, str]:
+        """Interaction authorization (niet execution-authorization).
+
+        1. exact allowed_user_id
+        2. exact allowed_chat_id
+        3. home_chat_id — private chat: trusted interaction chat; group/
+           supergroup: alléén met een expliciet geautoriseerde user (geen
+           wildcard: iedereen in de groep mag niet meespelen)
+        4. expliciete allowed_username
+
+        Exacte matches op string-genormaliseerde ids (Telegram ids zijn ints,
+        groepen negatief); geen fuzzy/substring/display-name matching.
+        """
         chat = str(message.get("chat", {}).get("id", ""))
-        username = str(message.get("from", {}).get("username", "")).lower()
-        if self.allowed_chat_ids and chat in self.allowed_chat_ids:
+        chat_type = str(message.get("chat", {}).get("type", ""))
+        frm = message.get("from") or {}
+        user_id = str(frm.get("id", ""))
+        username = str(frm.get("username", "")).strip().lower().lstrip("@")
+        if user_id and user_id in self.allowed_user_ids:
+            return True, username
+        if chat and chat in self.allowed_chat_ids:
+            return True, username
+        if self.home_chat_id and chat == self.home_chat_id:
+            if chat_type in ("group", "supergroup"):
+                if (user_id and user_id in self.allowed_user_ids) or (
+                        username and username in self.allowed_usernames):
+                    return True, username
+                return False, username
             return True, username
         if username and username in self.allowed_usernames:
             return True, username
