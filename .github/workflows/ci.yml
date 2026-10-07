@@ -15,14 +15,16 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - name: Install dependencies
+      - name: Install the project itself + dev extras
         run: |
           python -m pip install --upgrade pip
-          pip install aiohttp PyYAML pydantic pytest pytest-asyncio ruff
+          pip install -e '.[dev]'
       - name: Lint (ruff)
         run: ruff check hermes tests
       - name: Tests
         run: python -m pytest tests/ -q
+      - name: Package version resolves from package metadata
+        run: python -c "from importlib.metadata import version; from hermes import VERSION; assert VERSION == version('hermes-agent'); print('version OK:', VERSION)"
       - name: Verify no secrets in tree
         run: |
           ! grep -rEn "(bot[0-9]{6,}:[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{16,})" --include="*.py" --include="*.yaml" --include="*.yml" hermes config unraid .github

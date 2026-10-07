@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
 from conftest import FakeClock
 
 from hermes.config import Config
 from hermes.interfaces.notifier import Notifier
 from hermes.interfaces.telegram import format_alert, format_daily_summary
 from hermes.state.db import Database
-
-pytestmark = pytest.mark.asyncio
 
 
 class FakeTelegram:

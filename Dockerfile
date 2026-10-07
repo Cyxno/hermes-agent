@@ -1,7 +1,6 @@
 # Hermes v2 — production image (python:3.13-slim, non-root, stateless code)
 FROM python:3.13-slim AS base
 
-ARG VERSION=2.0.0
 ARG GIT_SHA=dev
 ARG BUILD_TIME=unknown
 ENV HERMES_GIT_SHA=${GIT_SHA} \

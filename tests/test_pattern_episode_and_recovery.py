@@ -11,10 +11,7 @@ Three soak-found bugs:
 
 from __future__ import annotations
 
-import pytest
 from conftest import run_cycles, set_plex_healthy, set_plex_unhealthy
-
-pytestmark = pytest.mark.asyncio
 
 
 def _add_transients(stack, fingerprint, count, spread=60.0):

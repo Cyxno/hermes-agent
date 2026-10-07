@@ -10,8 +10,6 @@ from hermes.intelligence.provider import AIRequest, AIResponse, extract_json
 from hermes.intelligence.router import AIRouter
 from hermes.state.db import Database
 
-pytestmark = pytest.mark.asyncio
-
 
 class ScriptedProvider:
     """Returns canned responses per model; records requested models in order."""

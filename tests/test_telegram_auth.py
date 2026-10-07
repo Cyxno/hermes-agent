@@ -12,13 +12,10 @@ aangevuld met exact allowed_user_id / allowed_chat_id / allowed_username.
 
 from __future__ import annotations
 
-import pytest
 from conftest import TEST_CONFIG
 
 from hermes.config import Config
 from hermes.interfaces.commands import CommandHandler
-
-pytestmark = pytest.mark.asyncio
 
 HOME = "123456789"          # private home chat
 GROUP = "-1009988776655"    # supergroup (negatief)

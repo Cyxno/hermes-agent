@@ -14,8 +14,6 @@ from hermes.intelligence.context import ContextBuilder
 from hermes.state.db import Database
 from hermes.util import safe_path, sanitize
 
-pytestmark = pytest.mark.asyncio
-
 
 @pytest.fixture()
 def exec_stack(tmp_path):

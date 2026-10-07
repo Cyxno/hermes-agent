@@ -1,22 +1,21 @@
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          body: |name: release
+name: release
 
 # Stable release pipeline. Pushing an immutable tag vMAJOR.MINOR.PATCH runs:
 # gate (tag == pyproject version) -> tests -> lint -> build -> GHCR publish
 # -> GitHub release with traceability.
 #
-# Prereleases (tags containing "-", e.g. v2.1.0-rc.1) publish the rc version
-# tag and X.Y-rc but NEVER move `latest`.
+# Prereleases (tags containing "-", e.g. v2.1.5-rc.2) publish their exact
+# version tag plus the X.Y-rc channel but NEVER move `latest` or `X.Y`.
 #
 # Hard rule (docs/RELEASE.md): once pushed, a tag is never moved or deleted.
-# A broken release is fixed by the next patch version.
+# A broken release is fixed by the next patch version. The preflight below
+# refuses a run whose tag no longer points at the built commit.
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch: {}   # test route (B7): run the pipeline without a tag
+    tags:
+      - "v*"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -25,12 +24,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # workflow_dispatch runs against a branch: gate the publish steps on a
-    # real tag ref so dispatch is a safe dry validation
     steps:
       - uses: actions/checkout@v4
 
-      - name: Release preflight — immutable tag policy (never move a published tag)
+      - name: Release preflight - immutable tag policy (never move a published tag)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           # A normal tag push creates the remote tag, so "tag exists" alone is
@@ -46,30 +43,40 @@ jobs:
           fi
           echo "preflight OK: tag ${GITHUB_REF_NAME} still points at ${GITHUB_SHA}"
 
-      - name: Verify tag matches version (tag pushes only)
+      - name: Verify tag matches package version (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PY_VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           [ "$TAG" = "$PY_VERSION" ] || { echo "tag $TAG != pyproject $PY_VERSION"; exit 1; }
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install + test
+
+      - name: Install the project itself (single source of truth for deps)
         run: |
-          pip install aiohttp PyYAML pydantic pytest pytest-asyncio ruff
-          ruff check hermes tests
-          python -m pytest tests/ -q
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Lint (ruff)
+        run: ruff check hermes tests
+
+      - name: Tests
+        run: python -m pytest tests/ -q
+
       - uses: docker/setup-buildx-action@v3
       - name: Resolve build time (head_commit is empty on tag pushes)
         id: bt
         run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/login-action@v3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - id: meta
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/metadata-action@v5
@@ -81,6 +88,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}.{{minor}}-rc,enable=${{ contains(github.ref_name, '-rc') }}
+
       - name: Build and push
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/build-push-action@v6
@@ -90,9 +98,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
             GIT_SHA=${{ github.sha }}
             BUILD_TIME=${{ steps.bt.outputs.time }}
+
       - name: Build sanity (no push) on dispatch runs
         if: github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
@@ -100,10 +108,12 @@ jobs:
           context: .
           push: false
           tags: hermes-agent:dispatch-check
+
       - name: Release notes with traceability
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Hermes ${{ github.ref_name }}
 

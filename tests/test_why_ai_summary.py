@@ -9,12 +9,9 @@ process) raised AttributeError.
 
 from __future__ import annotations
 
-import pytest
 from conftest import run_cycles, set_plex_unhealthy
 
 from hermes.evaluator.incidents import IncidentEngine
-
-pytestmark = pytest.mark.asyncio
 
 
 async def test_why_survives_incident_without_ai_summary(stack):

@@ -11,13 +11,10 @@ Root causes (live audit 2026-10-07):
 
 from __future__ import annotations
 
-import pytest
 from conftest import run_cycles, set_plex_unhealthy
 
 from hermes.intelligence.provider import ai_usage_for_incident
 from hermes.interfaces.telegram import format_alert
-
-pytestmark = pytest.mark.asyncio
 
 
 def beacon_payload(cpu_pct=None, mem_pct=None, temp=55, array="STARTED"):

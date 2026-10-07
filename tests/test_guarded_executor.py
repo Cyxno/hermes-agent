@@ -7,15 +7,12 @@ malicious targets, approval scoping. Real transport is always stubbed.
 
 from __future__ import annotations
 
-import pytest
 from conftest import FakeClock
 
 from hermes.executor.capabilities import CapabilityRegistry
 from hermes.executor.executor import ActionPlan, Executor, SshOperator
 from hermes.executor.policy import ApprovalStore, PolicyEngine
 from hermes.state.db import Database
-
-pytestmark = pytest.mark.asyncio
 
 
 class ScriptedOperator(SshOperator):

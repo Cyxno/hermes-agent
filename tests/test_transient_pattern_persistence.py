@@ -9,12 +9,9 @@ incident was never written — silently lost on restart.
 
 from __future__ import annotations
 
-import pytest
 from conftest import run_cycles, set_plex_healthy, set_plex_unhealthy
 
 from hermes.evaluator.incidents import IncidentEngine
-
-pytestmark = pytest.mark.asyncio
 
 
 async def test_transient_pattern_incident_is_persisted(stack):

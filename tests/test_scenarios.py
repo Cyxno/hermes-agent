@@ -6,14 +6,11 @@ the real engine (only transport/observers are stubs).
 
 from __future__ import annotations
 
-import pytest
 from conftest import run_cycles, set_plex_healthy, set_plex_unhealthy
 
 from hermes.evaluator.incidents import IncidentEngine
 from hermes.evaluator.pipeline import EvaluationPipeline
 from hermes.state.db import Database
-
-pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
